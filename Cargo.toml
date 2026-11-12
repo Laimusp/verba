@@ -1,0 +1,61 @@
+[package]
+name = "verba"
+version = "0.1.0"
+edition = "2021"
+description = "Диктовка для Windows: хоткей → речь → текст в поле"
+license = "MIT"
+publish = false
+
+[lib]
+name = "verba"
+path = "src/lib.rs"
+
+[[bin]]
+name = "verba"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["rt", "time", "macros", "sync", "net", "io-util"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2", "json", "socks"] }
+tower-layer = "0.3"
+tower-service = "0.3"
+cpal = "0.16"
+earshot = "1.2"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "net", "io-util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"

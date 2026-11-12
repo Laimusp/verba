@@ -1,0 +1,889 @@
+//! Контроллер — машина состояний диктовки в своём потоке. Связывает хук, микрофон, сеть,
+//! вставку и трей; сам ничего долгого не делает: всё долгое — в потоках-исполнителях, итоги
+//! приходят каналами.
+//!
+//! Диктовка: хоткей → микрофон (команда, не ожидание) + прогрев соединения → отпускание →
+//! хвост 100 мс → 16 кГц + VAD → OpenRouter с повторами → вставка → строка лога с фазами.
+//! Запись хранится (в памяти и в `pending.wav`) до успешного распознавания; ошибка — в трей
+//! словами «что не так → что сделать»; «вставить последнее» отправляет её снова.
+
+use std::collections::{HashMap, VecDeque};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use crossbeam_channel::{select, Receiver, Sender};
+
+use crate::audio::recorder::{AudioCmd, AudioEvent};
+use crate::config::{self, Bindings, Config, Paths, ProxyConfig, ProxyKind};
+use crate::hotkey::binding::{Binding, MOD_ALT, MOD_WIN};
+use crate::hotkey::hook::{self, HookEvent, HookThread, HotkeyId, MATCHER};
+use crate::hotkey::mode::{Action, ModeMachine};
+use crate::net::service::{NetCmd, NetEvent, NetService};
+use crate::net::{proxy, timing_words, words, Route, Warm};
+use crate::paste::{self, PasteReport};
+use crate::secrets;
+use crate::sound::{self, Cue};
+use crate::tray::{MenuCmd, Status, UiEvent, UiHandle};
+use crate::{error, info, warn};
+
+/// Удержание считается потерянным, если модификаторы основного сочетания отпущены дольше этого,
+/// а отпускания хук так и не увидел (Win+L, окно с правами администратора).
+const LOST_RELEASE_AFTER: Duration = Duration::from_millis(300);
+/// Медленная диктовка — отдельной строкой лога с разбором (CLAUDE.md §6).
+const SLOW: Duration = Duration::from_secs(3);
+
+pub struct Channels {
+    pub hook: Receiver<HookEvent>,
+    pub audio: Receiver<AudioEvent>,
+    pub net: Receiver<NetEvent>,
+    pub ui: Receiver<UiEvent>,
+    pub paste: Receiver<(u64, PasteReport)>,
+}
+
+#[derive(Default)]
+struct Dictation {
+    id: u64,
+    pressed_at: Option<Instant>,
+    released_at: Option<Instant>,
+    /// от нажатия до первого звука, мс; из них открытие устройства — `mic_device_ms`
+    mic_open_ms: Option<u64>,
+    mic_device_ms: u64,
+    device: String,
+    /// вставлять ли результат (Esc во время распознавания, блокировка экрана — нет)
+    paste: bool,
+    /// повтор сохранённой записи по «вставить последнее»
+    retry: bool,
+    total_ms: u64,
+    sent_ms: u64,
+    speech_ms: u64,
+    encode_ms: u64,
+    wav: Option<Arc<Vec<u8>>>,
+    sent_at: Option<Instant>,
+    warm: Option<Warm>,
+    net_ms: Option<u64>,
+    tries: usize,
+    net_detail: String,
+    paste_started: Option<Instant>,
+}
+
+pub struct Controller {
+    paths: Paths,
+    cfg: Config,
+    bindings: Bindings,
+    cfg_modified: Option<SystemTime>,
+    epoch: Instant,
+    machine: ModeMachine,
+    paused: bool,
+    locked: bool,
+    recording: Option<(u64, Instant)>,
+    dictations: HashMap<u64, Dictation>,
+    pasting: HashMap<u64, Dictation>,
+    next_id: u64,
+    history: VecDeque<String>,
+    /// последняя нераспознанная запись
+    pending: Option<Arc<Vec<u8>>>,
+    suppressed_while_locked: bool,
+    error: Option<String>,
+    has_key: bool,
+    mods_released_since: Option<Instant>,
+    detected_proxy: HashMap<(String, u16), ProxyKind>,
+    last_cfg_check: Instant,
+    ui: UiHandle,
+    net: NetService,
+    audio: Sender<AudioCmd>,
+    hook: HookThread,
+    paste_tx: Sender<(u64, PasteReport)>,
+}
+
+fn sec(ms: u64) -> String {
+    format!("{:.2} с", ms as f64 / 1000.0).replace('.', ",")
+}
+
+fn ms_between(a: Instant, b: Instant) -> u64 {
+    b.saturating_duration_since(a).as_millis() as u64
+}
+
+pub struct Parts {
+    pub paths: Paths,
+    pub cfg: Config,
+    pub bindings: Bindings,
+    pub cfg_modified: Option<SystemTime>,
+    pub ui: UiHandle,
+    pub net: NetService,
+    pub audio: Sender<AudioCmd>,
+    pub hook: HookThread,
+    pub paste_tx: Sender<(u64, PasteReport)>,
+    pub epoch: Instant,
+}
+
+impl Controller {
+    pub fn new(p: Parts) -> Self {
+        let machine = ModeMachine::new(p.cfg.hotkeys.mode, p.cfg.hotkeys.hybrid_hold_ms);
+        let pending = std::fs::read(p.paths.pending_file()).ok().filter(|w| w.len() > 44).map(Arc::new);
+        let mut c = Controller {
+            paths: p.paths,
+            cfg: p.cfg,
+            bindings: p.bindings,
+            cfg_modified: p.cfg_modified,
+            epoch: p.epoch,
+            machine,
+            paused: false,
+            locked: false,
+            recording: None,
+            dictations: HashMap::new(),
+            pasting: HashMap::new(),
+            next_id: 1,
+            history: VecDeque::new(),
+            pending,
+            suppressed_while_locked: false,
+            error: None,
+            has_key: secrets::read(secrets::OPENROUTER_KEY).is_some(),
+            mods_released_since: None,
+            detected_proxy: HashMap::new(),
+            last_cfg_check: Instant::now(),
+            ui: p.ui,
+            net: p.net,
+            audio: p.audio,
+            hook: p.hook,
+            paste_tx: p.paste_tx,
+        };
+        if c.pending.is_some() {
+            info!("есть нераспознанная запись с прошлого раза — «вставить последнее» отправит её");
+        }
+        if !c.has_key {
+            c.ui.notify(words::no_key());
+        }
+        c.apply_route();
+        c.publish();
+        c
+    }
+
+    pub fn run(mut self, ch: Channels) {
+        loop {
+            let wait = if self.recording.is_some() { Duration::from_millis(100) } else { Duration::from_secs(3) };
+            select! {
+                recv(ch.hook) -> m => match m {
+                    Ok(e) => self.on_hotkey(e),
+                    Err(_) => return,
+                },
+                recv(ch.audio) -> m => if let Ok(e) = m { self.on_audio(e) },
+                recv(ch.net) -> m => if let Ok(e) = m { self.on_net(e) },
+                recv(ch.ui) -> m => match m {
+                    Ok(UiEvent::Menu(MenuCmd::Exit)) | Err(_) => {
+                        self.shutdown();
+                        return;
+                    }
+                    Ok(e) => self.on_ui(e),
+                },
+                recv(ch.paste) -> m => if let Ok((id, r)) = m { self.on_paste(id, r) },
+                default(wait) => {}
+            }
+            self.tick();
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some((id, _)) = self.recording.take() {
+            let _ = self.audio.send(AudioCmd::Cancel { id });
+        }
+        info!("Verba закрыта из трея");
+        self.ui.quit();
+    }
+
+    fn now_ms(&self, at: Instant) -> u64 {
+        ms_between(self.epoch, at)
+    }
+
+    // ---------- хоткеи ----------
+
+    fn binding(&self, id: HotkeyId) -> Binding {
+        match id {
+            HotkeyId::Dictate => self.bindings.dictate,
+            HotkeyId::Cancel => self.bindings.cancel,
+            HotkeyId::Pause => self.bindings.pause,
+            HotkeyId::PasteLast => self.bindings.paste_last,
+        }
+    }
+
+    /// Проглоченное сочетание с Alt или Win: без маски отпускание Alt откроет меню окна.
+    fn mask_menu(&self, id: HotkeyId) {
+        if self.binding(id).mods & (MOD_ALT | MOD_WIN) != 0 {
+            hook::inject_menu_mask();
+        }
+    }
+
+    fn on_hotkey(&mut self, e: HookEvent) {
+        let ms = self.now_ms(e.at);
+        match (e.id, e.pressed) {
+            (HotkeyId::Dictate, true) => {
+                self.mask_menu(e.id);
+                if self.paused {
+                    return;
+                }
+                match self.machine.press(ms) {
+                    Action::Start => self.start(e.at),
+                    Action::Stop => self.stop(),
+                    Action::None => {}
+                }
+            }
+            (HotkeyId::Dictate, false) => {
+                if self.machine.release(ms) == Action::Stop {
+                    self.stop();
+                }
+            }
+            (HotkeyId::Cancel, true) => self.cancel(),
+            (HotkeyId::Pause, true) => {
+                self.mask_menu(e.id);
+                self.toggle_pause();
+            }
+            (HotkeyId::PasteLast, true) => {
+                self.mask_menu(e.id);
+                self.paste_last();
+            }
+            _ => {}
+        }
+    }
+
+    fn start(&mut self, pressed_at: Instant) {
+        self.reload_if_changed();
+        let id = self.next_id;
+        self.next_id += 1;
+        // первым — микрофон: каждая миллисекунда до его открытия — потерянный звук
+        let _ = self.audio.send(AudioCmd::Start { id });
+        self.recording = Some((id, pressed_at));
+        self.mods_released_since = None;
+        self.dictations.insert(id, Dictation { id, pressed_at: Some(pressed_at), paste: !self.locked, ..Default::default() });
+        MATCHER.set_cancel_armed(true);
+        let key = secrets::read(secrets::OPENROUTER_KEY);
+        self.has_key = key.is_some();
+        if let Some(key) = key {
+            self.net.send(NetCmd::Warm { key });
+        }
+        if self.cfg.sounds.recording {
+            sound::play(Cue::Start);
+        }
+        self.publish();
+    }
+
+    fn stop(&mut self) {
+        let Some((id, _)) = self.recording.take() else { return };
+        MATCHER.set_cancel_armed(false);
+        if let Some(d) = self.dictations.get_mut(&id) {
+            d.released_at = Some(Instant::now());
+        }
+        let _ = self.audio.send(AudioCmd::Stop {
+            id,
+            tail_ms: self.cfg.recording.tail_ms,
+            trim_silence: self.cfg.recording.trim_silence,
+        });
+        if self.cfg.sounds.recording {
+            sound::play(Cue::Stop);
+        }
+        self.publish();
+    }
+
+    fn cancel(&mut self) {
+        let Some((id, _)) = self.recording.take() else { return };
+        MATCHER.set_cancel_armed(false);
+        let _ = self.audio.send(AudioCmd::Cancel { id });
+        self.dictations.remove(&id);
+        self.machine.reset();
+        info!("диктовка #{id}: отменена");
+        self.publish();
+    }
+
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        MATCHER.set_paused(self.paused);
+        if self.paused {
+            self.cancel();
+        }
+        if self.cfg.sounds.pause {
+            sound::play(if self.paused { Cue::PauseOn } else { Cue::PauseOff });
+        }
+        info!("{}", if self.paused { "пауза: основной хоткей уходит в приложения" } else { "пауза снята" });
+        self.publish();
+    }
+
+    fn paste_last(&mut self) {
+        if let Some(wav) = self.pending.clone() {
+            let busy = self.dictations.values().any(|d| d.wav.as_ref().is_some_and(|w| Arc::ptr_eq(w, &wav)));
+            if busy {
+                self.ui.notify("Повтор уже идёт — дождись ответа");
+                return;
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            info!("диктовка #{id}: повтор сохранённой записи по «вставить последнее»");
+            self.dictations.insert(
+                id,
+                Dictation { id, paste: !self.locked, retry: true, wav: Some(wav.clone()), ..Default::default() },
+            );
+            self.transcribe(id, wav);
+            self.publish();
+        } else if let Some(text) = self.history.front().cloned() {
+            self.paste_text(0, text);
+        } else {
+            self.ui.notify("Вставлять нечего: диктовок ещё не было");
+        }
+    }
+
+    // ---------- микрофон ----------
+
+    fn on_audio(&mut self, e: AudioEvent) {
+        match e {
+            AudioEvent::Started { id, open_ms, device } => {
+                if let Some(d) = self.dictations.get_mut(&id) {
+                    d.mic_open_ms = d.pressed_at.map(|p| ms_between(p, Instant::now()));
+                    d.mic_device_ms = open_ms;
+                    d.device = device;
+                }
+            }
+            AudioEvent::Failed { id, words } => {
+                if self.recording.is_some_and(|(r, _)| r == id) {
+                    self.recording = None;
+                    MATCHER.set_cancel_armed(false);
+                    self.machine.reset();
+                }
+                self.dictations.remove(&id);
+                self.fail(id, words);
+            }
+            AudioEvent::Finished { id, processed, encode_ms, device_lost } => {
+                let Some(d) = self.dictations.get_mut(&id) else { return };
+                d.total_ms = processed.total_ms;
+                d.sent_ms = processed.sent_ms;
+                d.speech_ms = processed.speech_ms;
+                d.encode_ms = encode_ms;
+                if device_lost {
+                    warn!("диктовка #{id}: микрофон отключился посреди записи — отправляю то, что записано");
+                }
+                if self.cfg.recording.trim_silence && processed.speech_ms == 0 {
+                    let mic = match d.mic_open_ms {
+                        Some(ms) => format!("; хоткей→микрофон {ms} мс (открытие {} мс, {})", d.mic_device_ms, d.device),
+                        None => String::new(),
+                    };
+                    self.dictations.remove(&id);
+                    info!("диктовка #{id}: речи нет (запись {}{mic}) — не отправлял", sec(processed.total_ms));
+                    if processed.total_ms >= 1500 {
+                        self.ui.notify("Речи не слышно → проверь микрофон: выбран тот и не выключен ли звук");
+                    }
+                    self.publish();
+                    return;
+                }
+                let wav = Arc::new(processed.wav);
+                d.wav = Some(wav.clone());
+                self.transcribe(id, wav.clone());
+                self.set_pending(Some(wav));
+            }
+        }
+    }
+
+    fn transcribe(&mut self, id: u64, wav: Arc<Vec<u8>>) {
+        let Some(key) = secrets::read(secrets::OPENROUTER_KEY) else {
+            self.has_key = false;
+            if let Some(d) = self.dictations.remove(&id) {
+                self.log_timing(&d, None);
+            }
+            self.fail(id, words::no_key());
+            return;
+        };
+        if let Some(d) = self.dictations.get_mut(&id) {
+            d.sent_at = Some(Instant::now());
+        }
+        self.net.send(NetCmd::Transcribe { id, key, model: self.cfg.openrouter.model.clone(), wav });
+    }
+
+    fn set_pending(&mut self, wav: Option<Arc<Vec<u8>>>) {
+        let path = self.paths.pending_file();
+        match &wav {
+            Some(w) => {
+                let tmp = path.with_extension("wav.tmp");
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if let Err(e) = std::fs::write(&tmp, w.as_slice()).and_then(|_| std::fs::rename(&tmp, &path)) {
+                    warn!("запись не сохранена на диск ({e}) — держу в памяти");
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        self.pending = wav;
+    }
+
+    // ---------- сеть ----------
+
+    fn on_net(&mut self, e: NetEvent) {
+        match e {
+            NetEvent::Warmed(w) => {
+                if let Some(err) = &w.error {
+                    warn!("прогрев соединения не удался: {err}");
+                } else if w.replaced {
+                    warn!("прогрев: первое соединение молчало — открыто новое ({})", sec(w.ms));
+                }
+                let target = self.recording.map(|(id, _)| id).or_else(|| self.dictations.keys().max().copied());
+                if let Some(d) = target.and_then(|id| self.dictations.get_mut(&id)) {
+                    d.warm = Some(w);
+                }
+            }
+            NetEvent::Transcribed { id, model, result, sent_at } => {
+                let Some(mut d) = self.dictations.remove(&id) else { return };
+                d.sent_at = Some(sent_at);
+                match result {
+                    Ok(a) => {
+                        d.tries = a.attempts.len();
+                        d.net_ms = Some(a.ms);
+                        d.net_detail = timing_words(&a.attempts);
+                        if a.status == 200 {
+                            match a.text() {
+                                Some(t) if !t.is_empty() => self.succeed(d, t),
+                                _ => {
+                                    self.log_timing(&d, None);
+                                    self.fail(id, "модель вернула пустой текст → скажи ещё раз или «вставить последнее»".into());
+                                }
+                            }
+                        } else {
+                            self.log_timing(&d, None);
+                            let said = words::or_message(a.json.as_ref());
+                            if a.status == 401 || a.status == 403 {
+                                self.has_key = secrets::read(secrets::OPENROUTER_KEY).is_some();
+                            }
+                            self.fail(id, words::refusal(a.status, &said, &model));
+                        }
+                    }
+                    Err(f) => {
+                        d.tries = f.attempts().len();
+                        d.net_detail = timing_words(f.attempts());
+                        self.log_timing(&d, None);
+                        self.fail(id, f.words(self.cfg.proxy.is_some()));
+                    }
+                }
+                self.publish();
+            }
+            NetEvent::KeyChecked(r) => {
+                let text = match r {
+                    Ok(200) => "Ключ OpenRouter принят".to_string(),
+                    Ok(401) | Ok(403) => "OpenRouter не принял ключ → скопируй его заново целиком".to_string(),
+                    Ok(s) => format!("Ключ сохранён; OpenRouter ответил {s} — проверь диктовкой"),
+                    Err(e) => format!("Ключ сохранён, но проверить не удалось: {e}"),
+                };
+                info!("проверка ключа: {text}");
+                self.ui.notify(text);
+            }
+            NetEvent::ProxyDetected { host, port, kind } => {
+                let same = self.cfg.proxy.as_ref().is_some_and(|p| p.host == host && p.port == port);
+                match kind {
+                    Some(k) => {
+                        info!("прокси {host}:{port}: вид {k:?}");
+                        self.detected_proxy.insert((host.clone(), port), k);
+                        if same {
+                            if let Some(p) = self.cfg.proxy.as_mut() {
+                                p.kind = k;
+                            }
+                            self.save_config();
+                            self.apply_route();
+                            self.ui.notify(format!("Прокси {host}:{port} работает ({k:?})"));
+                        }
+                    }
+                    None => {
+                        warn!("прокси {host}:{port}: не ответил ни как HTTP, ни как SOCKS");
+                        self.ui.notify(format!("Прокси {host}:{port} не отвечает → проверь адрес, порт и логин"));
+                    }
+                }
+            }
+            NetEvent::RouteError(e) => {
+                error!("{e}");
+                self.ui.notify(e);
+            }
+        }
+    }
+
+    fn succeed(&mut self, d: Dictation, text: String) {
+        if self.pending.as_ref().zip(d.wav.as_ref()).is_some_and(|(p, w)| Arc::ptr_eq(p, w)) {
+            self.set_pending(None);
+        }
+        self.error = None;
+        self.history.push_front(text.clone());
+        self.history.truncate(self.cfg.history_size);
+        if d.paste && !self.locked {
+            let id = d.id;
+            let mut d = d;
+            d.paste_started = Some(Instant::now());
+            self.pasting.insert(id, d);
+            self.paste_text(id, text);
+        } else {
+            if self.locked {
+                self.suppressed_while_locked = true;
+            }
+            info!("диктовка #{}: распознана, не вставлена (отмена или экран заблокирован)", d.id);
+            self.log_timing(&d, None);
+        }
+        self.publish();
+    }
+
+    fn paste_text(&mut self, id: u64, mut text: String) {
+        if self.cfg.paste.trailing_space && !text.ends_with(char::is_whitespace) {
+            text.push(' ');
+        }
+        let tx = self.paste_tx.clone();
+        paste::paste(text, self.cfg.paste.method, self.cfg.paste.restore_clipboard, move |r| {
+            let _ = tx.send((id, r));
+        });
+    }
+
+    fn on_paste(&mut self, id: u64, r: PasteReport) {
+        if let Some(d) = self.pasting.remove(&id) {
+            self.log_timing(&d, Some(&r));
+        }
+        if let Some(e) = r.error {
+            self.fail(id, e);
+        } else if r.read_ms.is_none() && self.cfg.paste.restore_clipboard {
+            info!(
+                "вставка #{id}: приложение не прочитало буфер за 8 с — фокус не в текстовом поле или окно запущено                  с правами администратора (Verba без прав в него не пишет); текст — в «Последних диктовках»"
+            );
+        }
+    }
+
+    fn fail(&mut self, id: u64, words: String) {
+        error!("диктовка #{id}: {words}");
+        self.error = Some(words.clone());
+        self.ui.notify(words);
+        if self.cfg.sounds.errors {
+            sound::play(Cue::Error);
+        }
+        self.publish();
+    }
+
+    /// Строка лога с фазами (CLAUDE.md §6): без текста диктовки и ключей.
+    fn log_timing(&self, d: &Dictation, paste: Option<&PasteReport>) {
+        let mut parts = Vec::new();
+        if let Some(ms) = d.mic_open_ms {
+            let dev = if d.device.is_empty() { "?" } else { &d.device };
+            parts.push(format!("хоткей→микрофон {ms} мс (открытие {} мс, {dev})", d.mic_device_ms));
+        }
+        if d.retry {
+            parts.push("повтор сохранённой записи".into());
+        } else {
+            parts.push(format!("запись {}, речь {}, ушло {}", sec(d.total_ms), sec(d.speech_ms), sec(d.sent_ms)));
+            parts.push(format!("обработка {} мс", d.encode_ms));
+        }
+        if let Some(w) = &d.wav {
+            parts.push(format!("{} КБ", w.len() / 1024));
+        }
+        match &d.warm {
+            Some(Warm { connect_ms: Some(c), .. }) => parts.push(format!("прогрев: новое соединение {}", sec(*c))),
+            Some(Warm { error: Some(e), .. }) => parts.push(format!("прогрев не удался: {e}")),
+            Some(_) => parts.push("прогрев: соединение живое".into()),
+            None => {}
+        }
+        if let Some(ms) = d.net_ms {
+            parts.push(format!("сеть {} ({} отпр.)", sec(ms), d.tries.max(1)));
+        }
+        // от отпускания (или от повторной отправки) до Ctrl+V
+        let from = d.released_at.or(d.sent_at);
+        let mut total = None;
+        if let (Some(r), Some(ps)) = (paste, d.paste_started) {
+            parts.push(format!(
+                "вставка: Ctrl+V через {} мс, прочитано {}",
+                r.chord_ms,
+                r.read_ms.map(|m| format!("через {m} мс")).unwrap_or_else(|| "не было".into())
+            ));
+            if let Some(f) = from {
+                let ms = ms_between(f, ps) + r.chord_ms;
+                total = Some(ms);
+                let from = if d.retry { "от повторной отправки" } else { "от отпускания" };
+                parts.push(format!("{from} до вставки {}", sec(ms)));
+            }
+        }
+        info!("диктовка #{}: {}", d.id, parts.join("; "));
+        let slow = total.is_some_and(|t| t > SLOW.as_millis() as u64);
+        if slow || d.tries > 1 {
+            let what = if slow { "медленная" } else { "с повтором" };
+            let warm = match &d.warm {
+                Some(w) => format!(
+                    "; прогрев {} ({}{})",
+                    sec(w.ms),
+                    w.status.map(|s| s.to_string()).unwrap_or_else(|| "без ответа".into()),
+                    if w.replaced { ", клиент заменён" } else { "" }
+                ),
+                None => String::new(),
+            };
+            warn!("диктовка #{} {what}: {}{warm}", d.id, d.net_detail);
+        }
+    }
+
+    // ---------- трей и сессия ----------
+
+    fn on_ui(&mut self, e: UiEvent) {
+        match e {
+            UiEvent::Menu(cmd) => match cmd {
+                MenuCmd::TogglePause => self.toggle_pause(),
+                MenuCmd::SelectModel(i) => {
+                    if let Some(m) = self.cfg.openrouter.models.get(i).cloned() {
+                        info!("модель: {m}");
+                        self.cfg.openrouter.model = m;
+                        self.save_config();
+                        self.publish();
+                    }
+                }
+                MenuCmd::CopyHistory(i) => {
+                    if let Some(t) = self.history.get(i) {
+                        if !paste::copy_text(t) {
+                            self.ui.notify("Буфер обмена занят другой программой → попробуй ещё раз");
+                        }
+                    }
+                }
+                MenuCmd::OpenConfig => open_file(&self.paths.config_file()),
+                MenuCmd::OpenLog => open_file(&self.paths.log_file()),
+                MenuCmd::KeyFromClipboard => self.key_from_clipboard(),
+                MenuCmd::ProxyFromClipboard => self.proxy_from_clipboard(),
+                MenuCmd::Exit => {}
+            },
+            UiEvent::Lock => {
+                self.locked = true;
+                // отпускание сочетания на экране блокировки хук не увидит — запись не должна висеть
+                if self.recording.is_some() {
+                    info!("экран заблокирован во время записи — останавливаю, текст не вставлю");
+                    self.machine.reset();
+                    self.stop();
+                }
+                for d in self.dictations.values_mut() {
+                    d.paste = false;
+                }
+            }
+            UiEvent::Unlock | UiEvent::Resume => {
+                if matches!(e, UiEvent::Unlock) {
+                    self.locked = false;
+                }
+                self.hook.reinstall();
+                self.machine.forget_hold();
+                if self.recording.is_none() {
+                    MATCHER.reset_held();
+                }
+                if self.suppressed_while_locked && !self.locked {
+                    self.suppressed_while_locked = false;
+                    self.ui.notify(format!(
+                        "Пока экран был заблокирован, текст не вставлялся → «вставить последнее» ({})",
+                        self.bindings.paste_last.label()
+                    ));
+                }
+            }
+        }
+    }
+
+    fn key_from_clipboard(&mut self) {
+        let Some(text) = paste::clipboard_text() else {
+            self.ui.notify("В буфере обмена нет текста → скопируй ключ OpenRouter и выбери пункт ещё раз");
+            return;
+        };
+        let key = text.trim().to_string();
+        if key.len() < 20 || key.contains(char::is_whitespace) {
+            self.ui.notify("В буфере не ключ OpenRouter → скопируй ключ вида sk-or-v1-… с openrouter.ai/settings/keys");
+            return;
+        }
+        if let Err(e) = secrets::write(secrets::OPENROUTER_KEY, "openrouter", &key) {
+            self.fail(0, e);
+            return;
+        }
+        paste::clear_clipboard_if(&key);
+        info!("ключ OpenRouter сохранён в Credential Manager");
+        self.has_key = true;
+        self.error = None;
+        self.net.send(NetCmd::CheckKey { key });
+        self.publish();
+    }
+
+    fn proxy_from_clipboard(&mut self) {
+        let Some(text) = paste::clipboard_text() else {
+            self.ui.notify("В буфере обмена нет текста → скопируй строку прокси");
+            return;
+        };
+        let p = match proxy::parse(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                self.ui.notify(e);
+                return;
+            }
+        };
+        match &p.pass {
+            Some(pass) => {
+                if let Err(e) = secrets::write(secrets::PROXY_PASSWORD, p.user.as_deref().unwrap_or(""), pass) {
+                    self.fail(0, e);
+                    return;
+                }
+            }
+            None => secrets::delete(secrets::PROXY_PASSWORD),
+        }
+        if p.pass.is_some() {
+            paste::clear_clipboard_if(text.trim());
+        }
+        let kind = p.kind.unwrap_or(ProxyKind::Auto);
+        info!("прокси {}:{} ({kind:?}) сохранён", p.host, p.port);
+        self.cfg.proxy = Some(ProxyConfig { kind, host: p.host.clone(), port: p.port, user: p.user });
+        self.save_config();
+        self.apply_route();
+        let tail = if kind == ProxyKind::Auto { " — определяю вид" } else { "" };
+        self.ui.notify(format!("Прокси {}:{} сохранён{tail}", p.host, p.port));
+        self.publish();
+    }
+
+    // ---------- настройки ----------
+
+    fn route(&mut self) -> Route {
+        let base_url = self.cfg.openrouter.base_url.clone();
+        let Some(p) = self.cfg.proxy.clone() else { return Route { base_url, proxy: None } };
+        let pass = secrets::read(secrets::PROXY_PASSWORD);
+        let kind = match p.kind {
+            ProxyKind::Auto => match self.detected_proxy.get(&(p.host.clone(), p.port)) {
+                Some(k) => *k,
+                None => {
+                    self.net.send(NetCmd::DetectProxy {
+                        base_url: base_url.clone(),
+                        host: p.host.clone(),
+                        port: p.port,
+                        user: p.user.clone(),
+                        pass: pass.clone(),
+                    });
+                    // пока вид не известен — HTTP: самый частый
+                    ProxyKind::Http
+                }
+            },
+            k => k,
+        };
+        Route { base_url, proxy: Some(proxy::proxy_url(kind, &p.host, p.port, p.user.as_deref(), pass.as_deref())) }
+    }
+
+    fn apply_route(&mut self) {
+        let r = self.route();
+        self.net.send(NetCmd::SetRoute(r));
+    }
+
+    fn save_config(&mut self) {
+        let path = self.paths.config_file();
+        match config::save(&path, &self.cfg) {
+            Ok(()) => self.cfg_modified = config::modified(&path),
+            Err(e) => self.ui.notify(format!("настройки не сохранены: {e} → проверь права на {}", path.display())),
+        }
+    }
+
+    fn reload_if_changed(&mut self) {
+        let path = self.paths.config_file();
+        let m = config::modified(&path);
+        if m.is_none() || m == self.cfg_modified {
+            return;
+        }
+        self.cfg_modified = m;
+        match config::load(&path) {
+            Ok(l) => {
+                if self.recording.is_some() {
+                    // режим хоткея меняется только между записями — иначе отпускание потеряет смысл
+                    self.cfg_modified = None;
+                    return;
+                }
+                info!("настройки перечитаны");
+                let proxy_changed = l.config.proxy != self.cfg.proxy || l.config.openrouter.base_url != self.cfg.openrouter.base_url;
+                let mic_changed = l.config.microphone != self.cfg.microphone;
+                self.cfg = l.config;
+                self.bindings = l.bindings;
+                MATCHER.set_bindings(&self.bindings);
+                self.machine.configure(self.cfg.hotkeys.mode, self.cfg.hotkeys.hybrid_hold_ms);
+                if mic_changed {
+                    let _ = self.audio.send(AudioCmd::Configure(self.cfg.microphone.clone()));
+                }
+                if proxy_changed {
+                    self.apply_route();
+                }
+                self.publish();
+            }
+            Err(e) => {
+                warn!("{e}");
+                self.ui.notify(e);
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        let now = Instant::now();
+        if let Some((id, pressed_at)) = self.recording {
+            let limit = Duration::from_secs(u64::from(self.cfg.recording.max_seconds));
+            if now.duration_since(pressed_at) >= limit {
+                info!("диктовка #{id}: лимит длины {} с — останавливаю", self.cfg.recording.max_seconds);
+                self.ui.notify(format!(
+                    "Запись дошла до лимита {} с — отправляю. Лимит — recording.max_seconds в настройках",
+                    self.cfg.recording.max_seconds
+                ));
+                self.machine.reset();
+                self.stop();
+                return;
+            }
+            // сторож удержания: модификаторы отпущены, а отпускания сочетания хук не видел
+            if self.machine.holding() && hook::dictate_mods_released() {
+                let since = *self.mods_released_since.get_or_insert(now);
+                if now.duration_since(since) >= LOST_RELEASE_AFTER {
+                    warn!("диктовка #{id}: отпускание сочетания потерялось — останавливаю по модификаторам");
+                    self.machine.reset();
+                    self.machine.forget_hold();
+                    MATCHER.reset_held();
+                    self.stop();
+                }
+            } else {
+                self.mods_released_since = None;
+            }
+        } else if now.duration_since(self.last_cfg_check) >= Duration::from_secs(3) {
+            self.last_cfg_check = now;
+            self.reload_if_changed();
+        }
+    }
+
+    fn publish(&self) {
+        let status = if self.recording.is_some() {
+            Status::Recording
+        } else if !self.dictations.is_empty() {
+            Status::Transcribing
+        } else {
+            Status::Ready
+        };
+        let proxy = self.cfg.proxy.as_ref().map(|p| format!("{}:{}", p.host, p.port));
+        let history: Vec<String> = self.history.iter().cloned().collect();
+        let (paused, error, has_key) = (self.paused, self.error.clone(), self.has_key);
+        let model = self.cfg.openrouter.model.clone();
+        let models = self.cfg.openrouter.models.clone();
+        let labels = (self.bindings.pause.label(), self.bindings.dictate.label(), self.bindings.paste_last.label());
+        self.ui.update(move |s| {
+            s.status = status;
+            s.paused = paused;
+            s.error = error;
+            s.engine = "OpenRouter".into();
+            s.model = model;
+            s.models = models;
+            s.history = history;
+            s.pause_label = labels.0;
+            s.dictate_label = labels.1;
+            s.paste_last_label = labels.2;
+            s.has_key = has_key;
+            s.proxy = proxy;
+        });
+    }
+}
+
+/// Открыть файл программой по умолчанию; связи нет — Блокнотом. В своём потоке: ShellExecute
+/// бывает медленным, а контроллер не должен ждать.
+fn open_file(path: &Path) {
+    let path = path.to_path_buf();
+    let _ = std::thread::Builder::new().name("verba-open".into()).spawn(move || {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let p: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let r = ShellExecuteW(None, w!("open"), PCWSTR(p.as_ptr()), None, None, SW_SHOWNORMAL);
+            if r.0 as isize <= 32 {
+                let quoted: Vec<u16> =
+                    format!("\"{}\"", path.display()).encode_utf16().chain(std::iter::once(0)).collect();
+                ShellExecuteW(None, w!("open"), w!("notepad.exe"), PCWSTR(quoted.as_ptr()), None, SW_SHOWNORMAL);
+            }
+        }
+    });
+}
