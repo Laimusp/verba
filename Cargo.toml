@@ -19,7 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 crossbeam-channel = "0.5"
-tokio = { version = "1", features = ["rt", "time", "macros", "sync", "net", "io-util"] }
+tokio = { version = "1", features = ["rt", "time", "macros", "sync", "net", "io-util", "process"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2", "json", "socks"] }
 tower-layer = "0.3"
 tower-service = "0.3"
@@ -34,6 +34,7 @@ windows = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_DataExchange",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
@@ -51,7 +52,7 @@ windows = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "net", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "net", "io-util", "process"] }
 
 [profile.release]
 opt-level = 3

@@ -1,4 +1,6 @@
-//! OpenRouter: распознавание записи с повторами, прогрев соединения, проверка ключа и прокси.
+//! Сеть распознавания: запись с повторами, прогрев соединения, проверка ключа и прокси.
+//! Механизм (`Pool`) общий для обоих движков — OpenRouter (здесь) и ChatGPT по входу Codex
+//! (`codex.rs`).
 //!
 //! Почему так (research.md §«Почему Handy подвисает»): Handy открывал новое TCP+TLS на каждую
 //! диктовку и ждал единственную отправку 30 с. Путь до openrouter.ai у владельца идёт через
@@ -9,6 +11,8 @@
 //! - побеждает первый ответ, остальные отправки отменяются; ответивший клиент становится основным;
 //! - обрыв соединения или 5xx → следующая отправка сразу; 4xx не повторяется: сервис ответил.
 
+pub mod app_server;
+pub mod codex;
 pub mod proxy;
 pub mod service;
 pub mod words;
@@ -191,18 +195,26 @@ pub enum Failure {
     Unreachable { why: String, attempts: Vec<AttemptLog> },
     /// никто не ответил за отведённое время
     Timeout { secs: u64, attempts: Vec<AttemptLog> },
+    /// запись не ушла: нет входа или его не обновить (Codex); `words` — «что не так → что сделать»
+    Login { words: String },
 }
 
 impl Failure {
     pub fn attempts(&self) -> &[AttemptLog] {
         match self {
             Failure::Unreachable { attempts, .. } | Failure::Timeout { attempts, .. } => attempts,
+            Failure::Login { .. } => &[],
         }
     }
+    /// Слова для OpenRouter.
     pub fn words(&self, via_proxy: bool) -> String {
+        self.words_at(words::Service::OpenRouter, via_proxy)
+    }
+    pub fn words_at(&self, service: words::Service, via_proxy: bool) -> String {
         match self {
-            Failure::Unreachable { why, .. } => words::unreachable(why, via_proxy),
-            Failure::Timeout { secs, .. } => words::timeout(*secs, via_proxy),
+            Failure::Unreachable { why, .. } => words::unreachable_at(service, why, via_proxy),
+            Failure::Timeout { secs, .. } => words::unreachable_at(service, &format!("нет ответа за {secs} с"), via_proxy),
+            Failure::Login { words } => words.clone(),
         }
     }
 }
@@ -240,15 +252,23 @@ async fn read_limited(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-async fn send_once(slot: Arc<Slot>, url: String, key: String, body: bytes_body::Body) -> Result<SendResult, String> {
+/// Запрос распознавания, одинаковый для всех отправок одной записи.
+#[derive(Clone)]
+pub struct Post {
+    pub url: String,
+    pub headers: reqwest::header::HeaderMap,
+    /// тело делится между отправками без копирования; reqwest получает по копии на отправку —
+    /// для записи в сотни КБ это микросекунды
+    pub body: Arc<Vec<u8>>,
+}
+
+async fn send_once(slot: Arc<Slot>, post: Post) -> Result<SendResult, String> {
     let started = Instant::now();
     let resp = slot
         .client
-        .post(&url)
-        .bearer_auth(&key)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(reqwest::header::ACCEPT, "application/json")
-        .body(body.into_reqwest())
+        .post(&post.url)
+        .headers(post.headers)
+        .body(reqwest::Body::from(post.body.as_ref().clone()))
         .send()
         .await
         .map_err(|e| words::reqwest_why(&e))?;
@@ -260,28 +280,13 @@ async fn send_once(slot: Arc<Slot>, url: String, key: String, body: bytes_body::
     Ok(SendResult { status, json, headers_ms, body_ms })
 }
 
-/// Тело запроса делится между отправками без копирования.
-mod bytes_body {
-    use std::sync::Arc;
-    #[derive(Clone)]
-    pub struct Body(pub Arc<Vec<u8>>);
-    impl Body {
-        pub fn len(&self) -> usize {
-            self.0.len()
-        }
-        pub fn into_reqwest(self) -> reqwest::Body {
-            // reqwest::Body из Vec — одна копия на отправку; для записи в сотни КБ это микросекунды
-            reqwest::Body::from(self.0.as_ref().clone())
-        }
-    }
-}
-
-pub struct OpenRouter {
+/// Основной клиент с keep-alive и механизм повторов поверх него — общий для обоих движков.
+pub struct Pool {
     route: Route,
     primary: Mutex<Arc<Slot>>,
 }
 
-impl OpenRouter {
+impl Pool {
     pub fn new(route: Route) -> Result<Self, String> {
         let slot = Slot::build(&route)?;
         Ok(Self { route, primary: Mutex::new(slot) })
@@ -289,6 +294,10 @@ impl OpenRouter {
 
     pub fn route(&self) -> &Route {
         &self.route
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.route.base_url, path)
     }
 
     fn primary(&self) -> Arc<Slot> {
@@ -303,32 +312,15 @@ impl OpenRouter {
         Slot::build(&self.route)
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.route.base_url, path)
-    }
-
-    /// JSON-тело распознавания, как в QED (`service.ts:403`).
-    pub fn transcription_body(model: &str, wav: &[u8]) -> Vec<u8> {
-        let data = base64::engine::general_purpose::STANDARD.encode(wav);
-        serde_json::to_vec(&serde_json::json!({
-            "model": model,
-            "input_audio": { "data": data, "format": "wav" },
-        }))
-        .unwrap_or_default()
-    }
-
-    /// Открывает соединение заранее: GET /api/v1/key (маленький ответ; заодно проверка ключа).
-    /// Молчит дольше `wait` — клиент заменяется новым и прогревается ещё раз.
-    pub async fn warm(&self, key: &str, wait: Duration) -> Warm {
+    /// Открывает соединение заранее маленьким GET (любой ответ — путь жив). Молчит дольше
+    /// `wait` — клиент заменяется новым и прогревается ещё раз.
+    pub async fn warm(&self, url: &str, headers: reqwest::header::HeaderMap, wait: Duration) -> Warm {
         let started = Instant::now();
         let mut replaced = false;
         for round in 0..2 {
             let slot = self.primary();
             let before = slot.stats.opened.load(Ordering::Relaxed);
-            let mut req = slot.client.get(self.url("/api/v1/key"));
-            if !key.is_empty() {
-                req = req.bearer_auth(key);
-            }
+            let req = slot.client.get(url).headers(headers.clone());
             let res = tokio::time::timeout(wait, async {
                 let r = req.send().await?;
                 let status = r.status().as_u16();
@@ -372,25 +364,20 @@ impl OpenRouter {
         unreachable!("цикл прогрева возвращает на втором круге")
     }
 
-    /// Проверка ключа: статус GET /api/v1/key (200 — принят, 401/403 — нет).
-    pub async fn check_key(&self, key: &str, wait: Duration) -> Result<u16, String> {
+    /// Статус маленького GET через основной клиент.
+    pub async fn get_status(&self, url: &str, headers: reqwest::header::HeaderMap, wait: Duration) -> Result<u16, String> {
         let slot = self.primary();
         let fut = async {
-            let r = slot.client.get(self.url("/api/v1/key")).bearer_auth(key).send().await.map_err(|e| words::reqwest_why(&e))?;
+            let r = slot.client.get(url).headers(headers).send().await.map_err(|e| words::reqwest_why(&e))?;
             Ok(r.status().as_u16())
         };
         tokio::time::timeout(wait, fut).await.map_err(|_| format!("нет ответа за {} с", wait.as_secs()))?
     }
 
-    /// Распознавание записи с повторами. Отказ сервиса (статус ≥ 400) — это `Ok(Answer)`.
-    pub async fn transcribe(&self, key: &str, model: &str, wav: &[u8], hedge: Hedge) -> Result<Answer, Failure> {
-        let body = bytes_body::Body(Arc::new(Self::transcription_body(model, wav)));
-        self.send_hedged(&self.url("/api/v1/audio/transcriptions"), key, body, hedge).await
-    }
-
-    async fn send_hedged(&self, url: &str, key: &str, body: bytes_body::Body, hedge: Hedge) -> Result<Answer, Failure> {
-        let wait = Duration::from_millis(hedge.wait_ms(body.len()));
-        let overall_ms = hedge.overall_ms(body.len());
+    /// Запись с повторами. Отказ сервиса (статус ≥ 400) — это `Ok(Answer)`.
+    pub async fn send_hedged(&self, post: Post, hedge: Hedge) -> Result<Answer, Failure> {
+        let wait = Duration::from_millis(hedge.wait_ms(post.body.len()));
+        let overall_ms = hedge.overall_ms(post.body.len());
         let started = Instant::now();
         let mut set: tokio::task::JoinSet<Sent> = tokio::task::JoinSet::new();
         let mut attempts: Vec<AttemptLog> = Vec::new();
@@ -415,9 +402,9 @@ impl OpenRouter {
                 connect_ms: None,
                 outcome: Outcome::Dropped,
             });
-            let (url, key, body) = (url.to_string(), key.to_string(), body.clone());
+            let post = post.clone();
             set.spawn(async move {
-                let r = send_once(slot.clone(), url, key, body).await;
+                let r = send_once(slot.clone(), post).await;
                 (idx, slot, before, r)
             });
             true
@@ -515,7 +502,65 @@ impl OpenRouter {
     }
 }
 
-/// Вид прокси, когда строка его не назвала: HTTP, SOCKS5 и SOCKS4 пробуются сразу, побеждает
+fn bearer(key: &str) -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+        v.set_sensitive(true);
+        h.insert(reqwest::header::AUTHORIZATION, v);
+    }
+    h
+}
+
+pub struct OpenRouter {
+    pool: Pool,
+}
+
+impl OpenRouter {
+    pub fn new(route: Route) -> Result<Self, String> {
+        Ok(Self { pool: Pool::new(route)? })
+    }
+
+    pub fn route(&self) -> &Route {
+        self.pool.route()
+    }
+
+    /// JSON-тело распознавания, как в QED (`service.ts:403`).
+    pub fn transcription_body(model: &str, wav: &[u8]) -> Vec<u8> {
+        let data = base64::engine::general_purpose::STANDARD.encode(wav);
+        serde_json::to_vec(&serde_json::json!({
+            "model": model,
+            "input_audio": { "data": data, "format": "wav" },
+        }))
+        .unwrap_or_default()
+    }
+
+    /// Открывает соединение заранее: GET /api/v1/key (маленький ответ; заодно проверка ключа).
+    /// Молчит дольше `wait` — клиент заменяется новым и прогревается ещё раз.
+    pub async fn warm(&self, key: &str, wait: Duration) -> Warm {
+        let headers = if key.is_empty() { reqwest::header::HeaderMap::new() } else { bearer(key) };
+        self.pool.warm(&self.pool.url("/api/v1/key"), headers, wait).await
+    }
+
+    /// Проверка ключа: статус GET /api/v1/key (200 — принят, 401/403 — нет).
+    pub async fn check_key(&self, key: &str, wait: Duration) -> Result<u16, String> {
+        self.pool.get_status(&self.pool.url("/api/v1/key"), bearer(key), wait).await
+    }
+
+    /// Распознавание записи с повторами. Отказ сервиса (статус ≥ 400) — это `Ok(Answer)`.
+    pub async fn transcribe(&self, key: &str, model: &str, wav: &[u8], hedge: Hedge) -> Result<Answer, Failure> {
+        let mut headers = bearer(key);
+        headers.insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
+        headers.insert(reqwest::header::ACCEPT, reqwest::header::HeaderValue::from_static("application/json"));
+        let post = Post {
+            url: self.pool.url("/api/v1/audio/transcriptions"),
+            headers,
+            body: Arc::new(Self::transcription_body(model, wav)),
+        };
+        self.pool.send_hedged(post, hedge).await
+    }
+}
+
+// Вид прокси, когда строка его не назвала: HTTP, SOCKS5 и SOCKS4 пробуются сразу, побеждает
 /// первый, через который OpenRouter ответил хоть чем-то (как QED `service.ts:255`).
 pub async fn detect_proxy_kind(
     base_url: &str,

@@ -30,10 +30,28 @@ pub fn refusal(status: u16, said: &str, model: &str) -> String {
     }
 }
 
+/// Куда шла запись: от этого зависят слова о сбое сети.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Service {
+    OpenRouter,
+    /// chatgpt.com — движок «ChatGPT по входу Codex»
+    ChatGpt,
+}
+
 /// Сеть не довела запрос до ответа (все отправки оборвались или молчали).
 pub fn unreachable(why: &str, via_proxy: bool) -> String {
-    let check = if via_proxy { "проверь интернет и прокси" } else { "проверь интернет" };
-    format!("OpenRouter недоступен: {why} → {check}; запись сохранена — «вставить последнее» отправит её снова")
+    unreachable_at(Service::OpenRouter, why, via_proxy)
+}
+
+pub fn unreachable_at(service: Service, why: &str, via_proxy: bool) -> String {
+    let (name, check) = match (service, via_proxy) {
+        (Service::OpenRouter, true) => ("OpenRouter", "проверь интернет и прокси"),
+        (Service::OpenRouter, false) => ("OpenRouter", "проверь интернет"),
+        (Service::ChatGpt, true) => ("chatgpt.com", "проверь интернет и прокси"),
+        // путь до chatgpt.com из России — только VPN или прокси на уровне системы
+        (Service::ChatGpt, false) => ("chatgpt.com", "проверь интернет и VPN"),
+    };
+    format!("{name} недоступен: {why} → {check}; запись сохранена — «вставить последнее» отправит её снова")
 }
 
 pub fn timeout(secs: u64, via_proxy: bool) -> String {

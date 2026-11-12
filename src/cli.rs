@@ -1,18 +1,23 @@
-//! Команды из терминала: ключ OpenRouter и прокси — в Credential Manager.
+//! Команды из терминала: ключ OpenRouter и прокси — в Credential Manager; проверка движка Codex.
 //!
 //! Exe собран как оконное приложение (без консоли при автозапуске), поэтому вывод идёт в консоль
-//! того терминала, откуда запустили (`AttachConsole`). Ввод с клавиатуры не читаем: терминал не
+//! того терминала, откуда запустили (`AttachConsole`), а перенаправленный — в файл или канал. Ввод с клавиатуры не читаем: терминал не
 //! ждёт оконное приложение и делил бы ввод с ним. Ключ берётся из аргумента или из буфера обмена.
 
 use std::time::Duration;
 
 use windows::core::w;
 use windows::Win32::Foundation::{GENERIC_WRITE, HANDLE};
-use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, OPEN_EXISTING};
-use windows::Win32::System::Console::{AttachConsole, WriteConsoleW, ATTACH_PARENT_PROCESS};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, GetFileType, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_TYPE_PIPE, OPEN_EXISTING,
+};
+use windows::Win32::System::Console::{AttachConsole, GetStdHandle, WriteConsoleW, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE};
 
 use crate::config::{self, Paths, ProxyConfig, ProxyKind};
-use crate::net::{detect_proxy_kind, proxy, OpenRouter, Route};
+use crate::net::app_server::{find_codex, AppServer, Timeouts};
+use crate::net::codex::{self, Codex, CodexSetup, Login, Renewer};
+use crate::net::words::Service;
+use crate::net::{detect_proxy_kind, proxy, timing_words, Hedge, OpenRouter, Route};
 use crate::{paste, secrets};
 
 const HELP: &str = "\
@@ -26,28 +31,48 @@ Verba — диктовка: держишь хоткей → говоришь →
   verba proxy set [СТРОКА] сохранить прокси (без аргумента — из буфера обмена);
                            любая форма: socks5://логин:пароль@1.2.3.4:1080, 1.2.3.4:8080:логин:пароль…
   verba proxy clear        убрать прокси
+  verba codex check [ФАЙЛ.wav]  проверить движок «ChatGPT по входу Codex»: вход, путь, ответ;
+                           с файлом — прогреть соединение, распознать запись и показать задержку
 
 Ключ и пароль прокси хранятся в Windows Credential Manager, остальное — %APPDATA%\\Verba\\config.json.";
 
-struct Out(Option<HANDLE>);
+enum Out {
+    /// консоль терминала, откуда запустили
+    Console(HANDLE),
+    /// вывод перенаправлен в файл или канал (`verba codex check > out.txt`, скрипты) — писать туда:
+    /// WriteConsoleW в консоль родителя мимо перенаправления дал бы пустой файл
+    Redirected,
+    None,
+}
 
 impl Out {
     fn attach() -> Out {
         unsafe {
+            if let Ok(h) = GetStdHandle(STD_OUTPUT_HANDLE) {
+                if !h.is_invalid() && !h.0.is_null() && matches!(GetFileType(h), FILE_TYPE_PIPE | FILE_TYPE_DISK) {
+                    return Out::Redirected;
+                }
+            }
             if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
-                return Out(None);
+                return Out::None;
             }
             let h = CreateFileW(w!("CONOUT$"), GENERIC_WRITE.0, FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None);
-            Out(h.ok())
+            h.map(Out::Console).unwrap_or(Out::None)
         }
     }
     fn line(&self, s: &str) {
-        let text: Vec<u16> = format!("{s}\r\n").encode_utf16().collect();
-        match self.0 {
-            Some(h) => unsafe {
-                let _ = WriteConsoleW(h, &text, None, None);
+        match self {
+            Out::Console(h) => unsafe {
+                let text: Vec<u16> = format!("{s}\r\n").encode_utf16().collect();
+                let _ = WriteConsoleW(*h, &text, None, None);
             },
-            None => eprintln!("{s}"),
+            Out::Redirected => {
+                use std::io::Write;
+                let mut o = std::io::stdout().lock();
+                let _ = writeln!(o, "{s}");
+                let _ = o.flush();
+            }
+            Out::None => eprintln!("{s}"),
         }
     }
 }
@@ -94,6 +119,102 @@ fn key_from_handy() -> Option<String> {
         .map(str::trim)
         .filter(|k| !k.is_empty())
         .map(str::to_string)
+}
+
+fn sec(ms: u64) -> String {
+    format!("{:.2} с", ms as f64 / 1000.0).replace('.', ",")
+}
+
+/// `verba codex check [ФАЙЛ.wav]`: вход, прогрев, распознавание тишины или файла — с задержкой.
+fn codex_check(out: &Out, cfg: &config::Config, file: Option<&str>) -> i32 {
+    let auth_file = codex::auth_file();
+    let program = cfg.codex.program.as_ref().map(std::path::PathBuf::from);
+    match find_codex(program.as_deref()) {
+        Some(p) => out.line(&format!("Codex: {}", p.display())),
+        None => out.line("Codex не найден: вход не обновить, когда токен истечёт"),
+    }
+    match codex::read_login(&auth_file) {
+        Login::Ready(a) => {
+            let left = a.expires_at.map(|e| e as i64 - codex::now_secs() as i64);
+            let left = match left {
+                Some(s) if s > 0 => format!("токен ещё {} ч {} мин", s / 3600, s % 3600 / 60),
+                Some(_) => "токен истёк — Codex обновит его при отправке".into(),
+                None => "срок токена не указан".into(),
+            };
+            out.line(&format!("вход: ChatGPT ({}), {left}", auth_file.display()));
+        }
+        Login::None => out.line(&format!("входа нет ({})", auth_file.display())),
+        Login::ApiKey => out.line("Codex вошёл по ключу API"),
+        Login::Broken(why) => out.line(&format!("auth.json: {why}")),
+    }
+    let wav = match file {
+        Some(f) => match std::fs::read(f) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                out.line(&format!("файл {f} не прочитать: {e}"));
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let setup = CodexSetup { base_url: cfg.codex.base_url.clone(), proxy: route_from(cfg).proxy, auth_file, program };
+    let via_proxy = setup.proxy.is_some();
+    let c = match Codex::new(setup, Renewer::new(AppServer::new(Timeouts::default()))) {
+        Ok(c) => c,
+        Err(e) => {
+            out.line(&e);
+            return 1;
+        }
+    };
+    let Some(rt) = runtime() else { return 1 };
+    rt.block_on(async {
+        let w = c.warm(Duration::from_secs(4)).await;
+        let conn = match w.connect_ms {
+            Some(ms) => format!("новое соединение {}", sec(ms)),
+            None => "соединение прежнее".into(),
+        };
+        match (&w.error, w.status) {
+            (Some(e), _) => out.line(&format!("прогрев не удался за {}: {e}", sec(w.ms))),
+            (None, s) => out.line(&format!("прогрев: {conn}, ответ {} за {}", s.unwrap_or(0), sec(w.ms))),
+        }
+        let Some(wav) = wav else {
+            return match c.check(Hedge::default()).await {
+                Ok(ch) => {
+                    out.line(&format!(
+                        "ChatGPT по входу Codex работает: 0,3 с тишины → 200 за {}{}",
+                        sec(ch.ms),
+                        if ch.renewed { "; вход обновлён" } else { "" }
+                    ));
+                    0
+                }
+                Err(e) => {
+                    out.line(&e);
+                    1
+                }
+            };
+        };
+        let (r, trace) = c.transcribe(&wav, Hedge::default()).await;
+        let login = codex::trace_words(&trace);
+        if !login.is_empty() {
+            out.line(&login);
+        }
+        match r {
+            Ok(a) => {
+                out.line(&format!("ответ {} за {} ({})", a.status, sec(a.ms), timing_words(&a.attempts)));
+                if a.status == 200 {
+                    out.line(&format!("текст: {}", a.text().unwrap_or_default()));
+                    0
+                } else {
+                    out.line(&codex::answer_words(&a, &trace));
+                    1
+                }
+            }
+            Err(f) => {
+                out.line(&f.words_at(Service::ChatGpt, via_proxy));
+                1
+            }
+        }
+    })
 }
 
 fn load_config(out: &Out, paths: &Paths) -> Option<config::Config> {
@@ -244,6 +365,14 @@ pub fn run(args: &[String]) -> i32 {
             }
             out.line(&format!("прокси {}:{} сохранён; пароль — в Credential Manager (Verba/Proxy)", p.host, p.port));
             0
+        }
+        ["codex", "check"] => {
+            let Some(cfg) = load_config(&out, &paths) else { return 2 };
+            codex_check(&out, &cfg, None)
+        }
+        ["codex", "check", file] => {
+            let Some(cfg) = load_config(&out, &paths) else { return 2 };
+            codex_check(&out, &cfg, Some(file))
         }
         ["proxy", "clear"] => {
             let Some(mut cfg) = load_config(&out, &paths) else { return 2 };

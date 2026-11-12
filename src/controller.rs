@@ -3,7 +3,9 @@
 //! приходят каналами.
 //!
 //! Диктовка: хоткей → микрофон (команда, не ожидание) + прогрев соединения → отпускание →
-//! хвост 100 мс → 16 кГц + VAD → OpenRouter с повторами → вставка → строка лога с фазами.
+//! хвост 100 мс → 16 кГц + VAD → движок с повторами (OpenRouter или ChatGPT по входу Codex) →
+//! вставка → строка лога с фазами. Движок берётся при нажатии: переключение в трее действует со
+//! следующей диктовки.
 //! Запись хранится (в памяти и в `pending.wav`) до успешного распознавания; ошибка — в трей
 //! словами «что не так → что сделать»; «вставить последнее» отправляет её снова.
 
@@ -15,11 +17,13 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::{select, Receiver, Sender};
 
 use crate::audio::recorder::{AudioCmd, AudioEvent};
-use crate::config::{self, Bindings, Config, Paths, ProxyConfig, ProxyKind};
+use crate::config::{self, Bindings, Config, Engine, Paths, ProxyConfig, ProxyKind};
 use crate::hotkey::binding::{Binding, MOD_ALT, MOD_WIN};
 use crate::hotkey::hook::{self, HookEvent, HookThread, HotkeyId, MATCHER};
 use crate::hotkey::mode::{Action, ModeMachine};
-use crate::net::service::{NetCmd, NetEvent, NetService};
+use crate::net::codex::{self, CodexSetup};
+use crate::net::service::{Job, NetCmd, NetEvent, NetService};
+use crate::net::words::Service;
 use crate::net::{proxy, timing_words, words, Route, Warm};
 use crate::paste::{self, PasteReport};
 use crate::secrets;
@@ -44,6 +48,8 @@ pub struct Channels {
 #[derive(Default)]
 struct Dictation {
     id: u64,
+    /// чем распознаётся: берётся при нажатии хоткея (или при повторе)
+    engine: Engine,
     pressed_at: Option<Instant>,
     released_at: Option<Instant>,
     /// от нажатия до первого звука, мс; из них открытие устройства — `mic_device_ms`
@@ -64,6 +70,8 @@ struct Dictation {
     net_ms: Option<u64>,
     tries: usize,
     net_detail: String,
+    /// что было со входом Codex (обновление, повторная отправка)
+    login_detail: String,
     paste_started: Option<Instant>,
 }
 
@@ -151,7 +159,7 @@ impl Controller {
         if c.pending.is_some() {
             info!("есть нераспознанная запись с прошлого раза — «вставить последнее» отправит её");
         }
-        if !c.has_key {
+        if c.cfg.engine == Engine::OpenRouter && !c.has_key {
             c.ui.notify(words::no_key());
         }
         c.apply_route();
@@ -253,12 +261,19 @@ impl Controller {
         let _ = self.audio.send(AudioCmd::Start { id });
         self.recording = Some((id, pressed_at));
         self.mods_released_since = None;
-        self.dictations.insert(id, Dictation { id, pressed_at: Some(pressed_at), paste: !self.locked, ..Default::default() });
+        let engine = self.cfg.engine;
+        self.dictations.insert(id, Dictation { id, engine, pressed_at: Some(pressed_at), paste: !self.locked, ..Default::default() });
         MATCHER.set_cancel_armed(true);
-        let key = secrets::read(secrets::OPENROUTER_KEY);
-        self.has_key = key.is_some();
-        if let Some(key) = key {
-            self.net.send(NetCmd::Warm { key });
+        match engine {
+            Engine::OpenRouter => {
+                let key = secrets::read(secrets::OPENROUTER_KEY);
+                self.has_key = key.is_some();
+                if key.is_some() {
+                    self.net.send(NetCmd::Warm { engine, key });
+                }
+            }
+            // вход читается при отправке: прогреву он не нужен — chatgpt.com отвечает без входа
+            Engine::Codex => self.net.send(NetCmd::Warm { engine, key: None }),
         }
         if self.cfg.sounds.recording {
             sound::play(Cue::Start);
@@ -318,7 +333,7 @@ impl Controller {
             info!("диктовка #{id}: повтор сохранённой записи по «вставить последнее»");
             self.dictations.insert(
                 id,
-                Dictation { id, paste: !self.locked, retry: true, wav: Some(wav.clone()), ..Default::default() },
+                Dictation { id, engine: self.cfg.engine, paste: !self.locked, retry: true, wav: Some(wav.clone()), ..Default::default() },
             );
             self.transcribe(id, wav);
             self.publish();
@@ -380,18 +395,26 @@ impl Controller {
     }
 
     fn transcribe(&mut self, id: u64, wav: Arc<Vec<u8>>) {
-        let Some(key) = secrets::read(secrets::OPENROUTER_KEY) else {
-            self.has_key = false;
-            if let Some(d) = self.dictations.remove(&id) {
-                self.log_timing(&d, None);
+        let engine = self.dictations.get(&id).map(|d| d.engine).unwrap_or(self.cfg.engine);
+        let job = match engine {
+            Engine::OpenRouter => {
+                let Some(key) = secrets::read(secrets::OPENROUTER_KEY) else {
+                    self.has_key = false;
+                    if let Some(d) = self.dictations.remove(&id) {
+                        self.log_timing(&d, None);
+                    }
+                    self.fail(id, words::no_key());
+                    return;
+                };
+                Job::OpenRouter { key, model: self.cfg.openrouter.model.clone() }
             }
-            self.fail(id, words::no_key());
-            return;
+            // auth.json читает сетевой поток: диск — не здесь
+            Engine::Codex => Job::Codex,
         };
         if let Some(d) = self.dictations.get_mut(&id) {
             d.sent_at = Some(Instant::now());
         }
-        self.net.send(NetCmd::Transcribe { id, key, model: self.cfg.openrouter.model.clone(), wav });
+        self.net.send(NetCmd::Transcribe { id, job, wav });
     }
 
     fn set_pending(&mut self, wav: Option<Arc<Vec<u8>>>) {
@@ -428,9 +451,10 @@ impl Controller {
                     d.warm = Some(w);
                 }
             }
-            NetEvent::Transcribed { id, model, result, sent_at } => {
+            NetEvent::Transcribed { id, engine, result, sent_at, trace } => {
                 let Some(mut d) = self.dictations.remove(&id) else { return };
                 d.sent_at = Some(sent_at);
+                d.login_detail = codex::trace_words(&trace);
                 match result {
                     Ok(a) => {
                         d.tries = a.attempts.len();
@@ -446,30 +470,51 @@ impl Controller {
                             }
                         } else {
                             self.log_timing(&d, None);
-                            let said = words::or_message(a.json.as_ref());
-                            if a.status == 401 || a.status == 403 {
-                                self.has_key = secrets::read(secrets::OPENROUTER_KEY).is_some();
-                            }
-                            self.fail(id, words::refusal(a.status, &said, &model));
+                            let words = match engine {
+                                Engine::OpenRouter => {
+                                    if a.status == 401 || a.status == 403 {
+                                        self.has_key = secrets::read(secrets::OPENROUTER_KEY).is_some();
+                                    }
+                                    words::refusal(a.status, &words::or_message(a.json.as_ref()), &self.cfg.openrouter.model)
+                                }
+                                Engine::Codex => codex::answer_words(&a, &trace),
+                            };
+                            self.fail(id, words);
                         }
                     }
                     Err(f) => {
                         d.tries = f.attempts().len();
                         d.net_detail = timing_words(f.attempts());
                         self.log_timing(&d, None);
-                        self.fail(id, f.words(self.cfg.proxy.is_some()));
+                        let service = match engine {
+                            Engine::OpenRouter => Service::OpenRouter,
+                            Engine::Codex => Service::ChatGpt,
+                        };
+                        self.fail(id, f.words_at(service, self.cfg.proxy.is_some()));
                     }
                 }
                 self.publish();
             }
             NetEvent::KeyChecked(r) => {
                 let text = match r {
-                    Ok(200) => "Ключ OpenRouter принят".to_string(),
-                    Ok(401) | Ok(403) => "OpenRouter не принял ключ → скопируй его заново целиком".to_string(),
-                    Ok(s) => format!("Ключ сохранён; OpenRouter ответил {s} — проверь диктовкой"),
+                    Ok((200, ms)) => format!("Ключ OpenRouter принят, ответ за {}", sec(ms)),
+                    Ok((401 | 403, _)) => "OpenRouter не принял ключ → скопируй его заново целиком".to_string(),
+                    Ok((s, _)) => format!("Ключ сохранён; OpenRouter ответил {s} — проверь диктовкой"),
                     Err(e) => format!("Ключ сохранён, но проверить не удалось: {e}"),
                 };
                 info!("проверка ключа: {text}");
+                self.ui.notify(text);
+            }
+            NetEvent::CodexChecked(r) => {
+                let text = match r {
+                    Ok(c) => format!(
+                        "ChatGPT по входу Codex работает: ответ за {}{}",
+                        sec(c.ms),
+                        if c.renewed { "; вход Codex обновлён" } else { "" }
+                    ),
+                    Err(e) => e,
+                };
+                info!("проверка движка ChatGPT: {text}");
                 self.ui.notify(text);
             }
             NetEvent::ProxyDetected { host, port, kind } => {
@@ -558,7 +603,7 @@ impl Controller {
 
     /// Строка лога с фазами (CLAUDE.md §6): без текста диктовки и ключей.
     fn log_timing(&self, d: &Dictation, paste: Option<&PasteReport>) {
-        let mut parts = Vec::new();
+        let mut parts = vec![d.engine.label().to_string()];
         if let Some(ms) = d.mic_open_ms {
             let dev = if d.device.is_empty() { "?" } else { &d.device };
             parts.push(format!("хоткей→микрофон {ms} мс (открытие {} мс, {dev})", d.mic_device_ms));
@@ -577,6 +622,9 @@ impl Controller {
             Some(Warm { error: Some(e), .. }) => parts.push(format!("прогрев не удался: {e}")),
             Some(_) => parts.push("прогрев: соединение живое".into()),
             None => {}
+        }
+        if !d.login_detail.is_empty() {
+            parts.push(d.login_detail.clone());
         }
         if let Some(ms) = d.net_ms {
             parts.push(format!("сеть {} ({} отпр.)", sec(ms), d.tries.max(1)));
@@ -599,8 +647,14 @@ impl Controller {
         }
         info!("диктовка #{}: {}", d.id, parts.join("; "));
         let slow = total.is_some_and(|t| t > SLOW.as_millis() as u64);
-        if slow || d.tries > 1 {
-            let what = if slow { "медленная" } else { "с повтором" };
+        if slow || d.tries > 1 || !d.login_detail.is_empty() {
+            let what = if slow {
+                "медленная"
+            } else if d.tries > 1 {
+                "с повтором"
+            } else {
+                "с обновлением входа"
+            };
             let warm = match &d.warm {
                 Some(w) => format!(
                     "; прогрев {} ({}{})",
@@ -622,12 +676,26 @@ impl Controller {
                 MenuCmd::TogglePause => self.toggle_pause(),
                 MenuCmd::SelectModel(i) => {
                     if let Some(m) = self.cfg.openrouter.models.get(i).cloned() {
-                        info!("модель: {m}");
+                        // модель OpenRouter выбирает и сам движок
+                        info!("движок OpenRouter, модель: {m}");
                         self.cfg.openrouter.model = m;
+                        self.cfg.engine = Engine::OpenRouter;
                         self.save_config();
                         self.publish();
                     }
                 }
+                MenuCmd::SelectEngine(engine) => {
+                    if engine != self.cfg.engine {
+                        info!("движок: {} — со следующей диктовки", engine.label());
+                        self.cfg.engine = engine;
+                        self.save_config();
+                        if engine == Engine::OpenRouter && !self.has_key {
+                            self.ui.notify(words::no_key());
+                        }
+                        self.publish();
+                    }
+                }
+                MenuCmd::CheckEngine => self.check_engine(),
                 MenuCmd::CopyHistory(i) => {
                     if let Some(t) = self.history.get(i) {
                         if !paste::copy_text(t) {
@@ -669,6 +737,24 @@ impl Controller {
                         self.bindings.paste_last.label()
                     ));
                 }
+            }
+        }
+    }
+
+    /// «Проверить» в трее: путь до движка целиком; итог и задержка — уведомлением.
+    fn check_engine(&mut self) {
+        match self.cfg.engine {
+            Engine::OpenRouter => match secrets::read(secrets::OPENROUTER_KEY) {
+                Some(key) => self.net.send(NetCmd::CheckKey { key }),
+                None => {
+                    self.has_key = false;
+                    self.ui.notify(words::no_key());
+                    self.publish();
+                }
+            },
+            Engine::Codex => {
+                info!("проверка движка ChatGPT: 0,3 с тишины");
+                self.net.send(NetCmd::CheckCodex);
             }
         }
     }
@@ -731,9 +817,10 @@ impl Controller {
 
     // ---------- настройки ----------
 
-    fn route(&mut self) -> Route {
+    /// Адрес прокси с паролем; вид не известен — запуск определения и пока HTTP.
+    fn proxy_url(&mut self) -> Option<String> {
         let base_url = self.cfg.openrouter.base_url.clone();
-        let Some(p) = self.cfg.proxy.clone() else { return Route { base_url, proxy: None } };
+        let p = self.cfg.proxy.clone()?;
         let pass = secrets::read(secrets::PROXY_PASSWORD);
         let kind = match p.kind {
             ProxyKind::Auto => match self.detected_proxy.get(&(p.host.clone(), p.port)) {
@@ -752,12 +839,19 @@ impl Controller {
             },
             k => k,
         };
-        Route { base_url, proxy: Some(proxy::proxy_url(kind, &p.host, p.port, p.user.as_deref(), pass.as_deref())) }
+        Some(proxy::proxy_url(kind, &p.host, p.port, p.user.as_deref(), pass.as_deref()))
     }
 
+    /// Маршруты обоих движков: прокси общий.
     fn apply_route(&mut self) {
-        let r = self.route();
-        self.net.send(NetCmd::SetRoute(r));
+        let proxy = self.proxy_url();
+        self.net.send(NetCmd::SetRoute(Route { base_url: self.cfg.openrouter.base_url.clone(), proxy: proxy.clone() }));
+        self.net.send(NetCmd::SetCodex(CodexSetup {
+            base_url: self.cfg.codex.base_url.clone(),
+            proxy,
+            auth_file: codex::auth_file(),
+            program: self.cfg.codex.program.as_ref().map(std::path::PathBuf::from),
+        }));
     }
 
     fn save_config(&mut self) {
@@ -783,7 +877,9 @@ impl Controller {
                     return;
                 }
                 info!("настройки перечитаны");
-                let proxy_changed = l.config.proxy != self.cfg.proxy || l.config.openrouter.base_url != self.cfg.openrouter.base_url;
+                let proxy_changed = l.config.proxy != self.cfg.proxy
+                    || l.config.openrouter.base_url != self.cfg.openrouter.base_url
+                    || l.config.codex != self.cfg.codex;
                 let mic_changed = l.config.microphone != self.cfg.microphone;
                 self.cfg = l.config;
                 self.bindings = l.bindings;
@@ -847,15 +943,21 @@ impl Controller {
         };
         let proxy = self.cfg.proxy.as_ref().map(|p| format!("{}:{}", p.host, p.port));
         let history: Vec<String> = self.history.iter().cloned().collect();
-        let (paused, error, has_key) = (self.paused, self.error.clone(), self.has_key);
-        let model = self.cfg.openrouter.model.clone();
+        let engine = self.cfg.engine;
+        // ключ OpenRouter нужен, только когда выбран OpenRouter
+        let (paused, error, has_key) = (self.paused, self.error.clone(), self.has_key || engine == Engine::Codex);
+        let model = match engine {
+            Engine::OpenRouter => self.cfg.openrouter.model.clone(),
+            Engine::Codex => "вход Codex".to_string(),
+        };
         let models = self.cfg.openrouter.models.clone();
         let labels = (self.bindings.pause.label(), self.bindings.dictate.label(), self.bindings.paste_last.label());
         self.ui.update(move |s| {
             s.status = status;
             s.paused = paused;
             s.error = error;
-            s.engine = "OpenRouter".into();
+            s.engine = engine.label().into();
+            s.codex = engine == Engine::Codex;
             s.model = model;
             s.models = models;
             s.history = history;

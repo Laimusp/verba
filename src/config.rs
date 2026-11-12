@@ -47,10 +47,23 @@ impl Default for Hotkeys {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Engine {
+    #[default]
     OpenRouter,
+    /// ChatGPT по входу Codex (auth.json Codex, подписка ChatGPT)
+    Codex,
+}
+
+impl Engine {
+    /// Имя в трее и логе.
+    pub fn label(self) -> &'static str {
+        match self {
+            Engine::OpenRouter => "OpenRouter",
+            Engine::Codex => "ChatGPT",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,6 +89,22 @@ impl Default for OpenRouter {
             model: "openai/gpt-transcribe".into(),
             base_url: "https://openrouter.ai".into(),
         }
+    }
+}
+
+/// Движок «ChatGPT по входу Codex».
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Codex {
+    /// адрес ChatGPT; меняют только тесты и отладка
+    pub base_url: String,
+    /// путь к codex (codex.cmd или codex.exe), если его нет на PATH; null — искать самой
+    pub program: Option<String>,
+}
+
+impl Default for Codex {
+    fn default() -> Self {
+        Self { base_url: "https://chatgpt.com".into(), program: None }
     }
 }
 
@@ -182,6 +211,8 @@ pub struct Config {
     pub engine: Engine,
     pub hotkeys: Hotkeys,
     pub openrouter: OpenRouter,
+    pub codex: Codex,
+    /// прокси для обоих движков
     pub proxy: Option<ProxyConfig>,
     pub microphone: Microphone,
     pub recording: Recording,
@@ -197,6 +228,7 @@ impl Default for Config {
             engine: Engine::OpenRouter,
             hotkeys: Hotkeys::default(),
             openrouter: OpenRouter::default(),
+            codex: Codex::default(),
             proxy: None,
             microphone: Microphone::default(),
             recording: Recording::default(),
@@ -253,6 +285,12 @@ impl Config {
             return Err(format!("openrouter.base_url = \"{base}\" — не адрес → верни \"https://openrouter.ai\""));
         }
         self.openrouter.base_url = base;
+        let base = self.codex.base_url.trim().trim_end_matches('/').to_string();
+        if !(base.starts_with("https://") || base.starts_with("http://")) {
+            return Err(format!("codex.base_url = \"{base}\" — не адрес → верни \"https://chatgpt.com\""));
+        }
+        self.codex.base_url = base;
+        self.codex.program = self.codex.program.take().map(|p| p.trim().trim_matches('"').to_string()).filter(|p| !p.is_empty());
         Ok(b)
     }
 }
@@ -369,6 +407,22 @@ mod tests {
         c.hotkeys.dictate = "ctrl+nope".into();
         let e = c.validate().unwrap_err();
         assert!(e.contains("hotkeys.dictate"), "{e}");
+    }
+
+    #[test]
+    fn engine_codex_reads_and_old_files_stay_openrouter() {
+        let mut c: Config = serde_json::from_str(r#"{"engine": "codex", "codex": {"program": " \"C:\\x\\codex.cmd\" "}}"#).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.engine, Engine::Codex);
+        assert_eq!(c.codex.base_url, "https://chatgpt.com");
+        assert_eq!(c.codex.program.as_deref(), Some("C:\\x\\codex.cmd"));
+        let mut old: Config = serde_json::from_str(r#"{"engine": "open_router"}"#).unwrap();
+        old.validate().unwrap();
+        assert_eq!(old.engine, Engine::OpenRouter);
+        assert_eq!(old.codex, Codex::default());
+        let mut bad = Config::default();
+        bad.codex.base_url = "chatgpt.com".into();
+        assert!(bad.validate().unwrap_err().contains("codex.base_url"));
     }
 
     #[test]

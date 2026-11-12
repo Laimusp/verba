@@ -48,6 +48,18 @@
 ## Сеть: отказ в соединении на localhost
 - **Замер:** подключение к порту, где никто не слушает, на Windows длится ~2 с (повторы SYN после RST), а не мгновенно. Три отправки подряд — ~6 с до ошибки (`tests/openrouter.rs` `nothing_listening_is_unreachable_fast`).
 
+## codex app-server: дочерний процесс без окна и без сирот
+- **Что:** Codex из npm — `codex.cmd` → node → `codex.exe`. Rust запускает `.cmd` через `cmd.exe` сам (обработка `.bat`/`.cmd` в `std::process::Command`, исправленная в Rust 1.77.2 после CVE-2024-24576). Verba — оконное приложение: без `CREATE_NO_WINDOW` у cmd.exe появилось бы консольное окно. Убить только cmd.exe мало — node и codex.exe остались бы сиротами.
+- **Источник:** [Process Creation Flags](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags) (`CREATE_NO_WINDOW`); [Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) и [JOBOBJECT_BASIC_LIMIT_INFORMATION](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information) (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; вложенные задания — с Windows 8).
+- **Как в Verba:** процесс сразу после запуска входит в Job Object с KILL_ON_JOB_CLOSE; дети (node, codex.exe) входят в задание сами. Закрытие: stdin закрыт → сервер выходит сам; не вышел за 2 с → `TerminateJobObject`. Verba упала — Windows закрывает хэндл задания, дерево уходит с ним (`src/net/app_server.rs`).
+- **Проверено:** фейковый сервер, зависший на `initialize` за `.cmd` (cmd.exe → exe), снят целиком — после тестов 0 процессов; настоящий `codex app-server` (Codex CLI 0.154) закрылся по простою, `codex.exe` не осталось (12.11.2026). Окно консоли глазами не проверялось. [не проверено вживую: мелькание окна]
+- **Риск:** между `CreateProcess` и входом в задание проходят микросекунды; cmd.exe запускает node позже, так что гонки нет [гипотеза].
+
+## Вывод CLI оконного приложения в файл
+- **Что:** у оконного exe `WriteConsoleW` в консоль родителя (`AttachConsole`) идёт мимо перенаправления: `verba codex check > out.txt` давал пустой файл. Перенаправленный stdout (тип `FILE_TYPE_PIPE` или `FILE_TYPE_DISK` у `GetStdHandle`) — пишем в него.
+- **Источник:** [GetFileType](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfiletype), [AttachConsole](https://learn.microsoft.com/en-us/windows/win32/api/wincon/nf-wincon-attachconsole).
+- **Проверено:** `verba codex check > файл` из bash — вывод в файле (12.11.2026).
+
 ## Активация окна из тестового сценария
 - **Что:** `SetForegroundWindow` из фонового процесса запрещён (foreground lock); работает после `AttachThreadInput` к потоку переднего окна.
 - **Источник:** [SetForegroundWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow), [AttachThreadInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-attachthreadinput).

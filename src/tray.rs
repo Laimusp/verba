@@ -36,6 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WTS_SESSION_UNLOCK,
 };
 
+use crate::config::Engine;
 use crate::icons::{self, IconState};
 
 pub const WINDOW_CLASS: PCWSTR = w!("VerbaTray");
@@ -62,6 +63,8 @@ pub struct UiState {
     /// последняя ошибка (значок с красной точкой), пока не пройдёт удачная диктовка
     pub error: Option<String>,
     pub engine: String,
+    /// выбран движок «ChatGPT по входу Codex»
+    pub codex: bool,
     pub model: String,
     pub models: Vec<String>,
     /// последние диктовки, новые сверху
@@ -78,6 +81,9 @@ pub struct UiState {
 #[derive(Debug, Clone)]
 pub enum MenuCmd {
     TogglePause,
+    SelectEngine(Engine),
+    /// «Проверить движок»: путь до сервиса целиком, итог — уведомлением
+    CheckEngine,
     SelectModel(usize),
     CopyHistory(usize),
     OpenConfig,
@@ -260,6 +266,15 @@ fn short_model(m: &str) -> &str {
     m.rsplit('/').next().unwrap_or(m)
 }
 
+/// Чем распознаёт: модель OpenRouter или ChatGPT.
+fn engine_words(s: &UiState) -> String {
+    if s.codex {
+        "ChatGPT по входу Codex".into()
+    } else {
+        format!("{} · {}", s.engine, short_model(&s.model))
+    }
+}
+
 impl Ctx {
     fn icon(&mut self, st: IconState) -> HICON {
         let key = (st, icon_size(), self.dark);
@@ -292,7 +307,7 @@ impl Ctx {
             let Ok(mut s) = self.state.lock() else { return };
             let mut tip = format!("Verba — {}", status_words(&s));
             if !s.model.is_empty() {
-                tip.push_str(&format!("\n{} · {}", s.engine, short_model(&s.model)));
+                tip.push_str(&format!("\n{}", engine_words(&s)));
             }
             if let Some(e) = &s.error {
                 tip.push_str(&format!("\n{e}"));
@@ -346,7 +361,7 @@ impl Ctx {
             };
             let head = match &s.error {
                 Some(e) if s.status == Status::Ready && !s.paused => format!("Verba · {e}"),
-                _ => format!("Verba · {} · {}", status_words(&s), short_model(&s.model)),
+                _ => format!("Verba · {} · {}", status_words(&s), if s.codex { "ChatGPT" } else { short_model(&s.model) }),
             };
             let head: String = head.chars().take(90).collect();
             add(menu, MF_STRING | MF_GRAYED, 1, &esc(&head));
@@ -356,11 +371,12 @@ impl Ctx {
             add(menu, MF_STRING | if s.paused { MF_CHECKED } else { MF_STRING }, 2, &format!("Пауза\t{}", s.pause_label));
 
             if let Ok(models) = CreatePopupMenu() {
-                add(models, MF_STRING | MF_CHECKED | MF_GRAYED, 9, &s.engine);
+                let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+                add(models, check(!s.codex), 10, "OpenRouter");
                 for (i, m) in s.models.iter().enumerate().take(50) {
-                    let flags = if *m == s.model { MF_STRING | MF_CHECKED } else { MF_STRING };
-                    add(models, flags, 100 + i, &esc(m));
+                    add(models, check(!s.codex && *m == s.model), 100 + i, &esc(&format!("      {m}")));
                 }
+                add(models, check(s.codex), 11, "ChatGPT по входу Codex");
                 add(models, MF_STRING, 30, "Ключ OpenRouter из буфера обмена");
                 let proxy = match &s.proxy {
                     Some(p) => format!("Прокси из буфера обмена (сейчас {p})"),
@@ -369,6 +385,7 @@ impl Ctx {
                 add(models, MF_STRING, 31, &esc(&proxy));
                 add(menu, MF_POPUP, models.0 as usize, "Движок и модель");
             }
+            add(menu, MF_STRING, 32, "Проверить движок");
             if let Ok(hist) = CreatePopupMenu() {
                 if s.history.is_empty() {
                     add(hist, MF_STRING | MF_GRAYED, 8, "Диктовок пока нет");
@@ -396,6 +413,9 @@ impl Ctx {
             let _ = DestroyMenu(menu);
             let cmd = match cmd {
                 2 => Some(MenuCmd::TogglePause),
+                10 => Some(MenuCmd::SelectEngine(Engine::OpenRouter)),
+                11 => Some(MenuCmd::SelectEngine(Engine::Codex)),
+                32 => Some(MenuCmd::CheckEngine),
                 20 => Some(MenuCmd::OpenConfig),
                 21 => Some(MenuCmd::OpenLog),
                 30 => Some(MenuCmd::KeyFromClipboard),
