@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Verba — видео для README</title>
+<!--
+  Видео README: сцена 1280×720, всё движение — чистая функция времени render(t) (движок — как у видео QED).
+  render.mjs ставит t кадр за кадром и снимает экран через Chrome; открыть файл в браузере — проиграется само.
+  Петля без шва: первый кадр — плитка знака с одним курсором, последний — он же.
+  Сюжет — девиз «Verba volant, scripta manent»: голос появляется → слова улетают → текст встаёт у курсора →
+  сеть зависла, а запись дошла → памяти почти не нужно → голос улетает в курсор, курсор остаётся.
+  Числа — как в README: ≈ 1 с от отпускания до текста, повтор через 4 с, 2 МБ против 286 МБ в простое.
+-->
+<style>
+  :root {
+    --bg0: #161513; --bg1: #1b1917; --bg2: #22201e; --bg3: #2c2a26; --field: #1e1c1a;
+    --fg0: #ebe9e6; --fg1: #aba69f; --fg2: #85817a; --line: #3a3733;
+    --coral: #E5484D; --amber: #F5A524; --ok: #69bb94; --ink: #1b1917;
+    --sans: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+    --disp: 'Segoe UI Variable Display', 'Segoe UI', system-ui, sans-serif;
+    --mono: 'Cascadia Mono', 'Cascadia Code', Consolas, monospace;
+    --raise: inset 0 1px 0 rgba(255, 255, 255, .045), 0 0 0 1px rgba(0, 0, 0, .4), 0 1px 2px rgba(0, 0, 0, .25), 0 10px 24px -10px rgba(0, 0, 0, .55);
+  }
+  html, body { margin: 0; background: var(--bg0); }
+  body { display: grid; place-items: center; min-height: 100vh; }
+  #stage {
+    position: relative; width: 1280px; height: 720px; overflow: hidden; background: var(--bg0);
+    font-family: var(--sans); color: var(--fg0); -webkit-font-smoothing: antialiased;
+  }
+  .a { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  .c { transform-origin: 50% 50%; }
+  svg .fb { transform-box: fill-box; transform-origin: 50% 50%; }
+
+  /* the lockup: plate + word */
+  #lock { width: 600px; height: 168px; z-index: 30; }
+  #plate { position: absolute; left: 0; top: 0; width: 168px; height: 168px; overflow: visible; }
+  #word { position: absolute; left: 198px; top: 0; height: 168px; line-height: 168px; font-family: var(--disp); font-weight: 700; font-size: 150px; letter-spacing: -.01em; white-space: nowrap; }
+  #word span { display: inline-block; }
+  #motto { width: 1280px; text-align: center; font-size: 19px; letter-spacing: .32em; color: var(--fg2); z-index: 30; white-space: nowrap; }
+  #motto i { font-style: normal; display: inline-block; }
+
+  /* captions */
+  #sep { width: 1px; height: 30px; background: rgba(255, 255, 255, .12); z-index: 30; }
+  #capbox { width: 1000px; height: 46px; overflow: hidden; z-index: 30; }
+  .cap { display: flex; align-items: baseline; gap: 16px; white-space: nowrap; height: 46px; line-height: 46px; }
+  .cap .n { font-family: var(--mono); font-size: 20px; color: var(--coral); }
+  .cap .t { font-family: var(--disp); font-size: 30px; font-weight: 600; letter-spacing: -.005em; }
+  .cap .t em { font-style: normal; color: var(--fg1); font-weight: 400; }
+
+  /* act 1: chat, voice, keys, taskbar */
+  #chat { width: 640px; height: 476px; border-radius: 18px; background: var(--bg1); box-shadow: var(--raise); z-index: 5; }
+  #chat .hd { position: absolute; left: 0; top: 0; width: 640px; height: 72px; display: flex; align-items: center; gap: 14px; padding: 0 24px; box-sizing: border-box; box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .35); }
+  #chat .av { width: 40px; height: 40px; border-radius: 50%; background: #3b4a5c; display: grid; place-items: center; font-weight: 600; font-size: 18px; color: #c9d6e6; }
+  #chat .nm { font-size: 20px; font-weight: 600; }
+  #chat .st { font-size: 15px; color: var(--fg2); margin-top: 2px; }
+  .bub { position: absolute; left: 24px; padding: 11px 16px; border-radius: 16px 16px 16px 6px; background: var(--bg3); font-size: 19px; white-space: nowrap; }
+  .bub .tm { font-size: 13px; color: var(--fg2); margin-left: 12px; }
+  .bub.me { left: auto; right: 24px; background: #2d3a48; border-radius: 16px 16px 6px 16px; }
+  #field { position: absolute; left: 20px; top: 400px; width: 600px; height: 56px; border-radius: 14px; background: var(--field); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .04); }
+  #ph { position: absolute; left: 20px; top: 0; line-height: 56px; font-size: 19px; color: var(--fg2); white-space: nowrap; }
+  #typed { position: absolute; left: 20px; top: 0; line-height: 56px; font-size: 19px; white-space: pre; }
+  #fcaret { position: absolute; top: 15px; width: 2px; height: 26px; background: var(--fg0); }
+  #wave { width: 344px; height: 10px; z-index: 6; }
+  .wb { position: absolute; left: 0; top: 0; width: 8px; border-radius: 4px; background: var(--coral); }
+  #words { width: 1px; height: 1px; z-index: 7; }
+  .wd { position: absolute; left: 0; top: 0; font-family: var(--disp); font-size: 24px; color: var(--fg1); white-space: nowrap; transform-origin: 50% 50%; }
+  #dot { width: 18px; height: 18px; border-radius: 50%; background: var(--coral); z-index: 8; }
+  .key {
+    height: 60px; padding: 0 22px; border-radius: 13px; background: var(--bg3); box-shadow: inset 0 -3px 0 rgba(0, 0, 0, .35), 0 0 0 1px rgba(0, 0, 0, .45);
+    font-size: 23px; font-weight: 600; line-height: 58px; z-index: 6; white-space: nowrap; overflow: hidden;
+  }
+  .key .kf { position: absolute; inset: 0; background: rgba(229, 72, 77, .28); border-radius: 13px; }
+  .key b { position: relative; font-weight: 600; }
+  #kplus { font-size: 24px; color: var(--fg2); z-index: 6; }
+  #timer { width: 344px; text-align: center; font-family: var(--mono); font-size: 76px; letter-spacing: -.02em; z-index: 6; white-space: nowrap; }
+  #timer small { font-size: 34px; color: var(--fg1); margin-left: 8px; }
+  #tsub { width: 344px; text-align: center; font-size: 19px; color: var(--fg1); z-index: 6; white-space: nowrap; }
+  #taskbar { width: 1280px; height: 52px; background: #1f1e1c; box-shadow: 0 -1px 0 rgba(255, 255, 255, .05); z-index: 4; }
+  #taskbar .apps { position: absolute; left: 520px; top: 12px; display: flex; gap: 14px; }
+  #taskbar .apps i { width: 28px; height: 28px; border-radius: 7px; background: #3a3835; display: block; }
+  #taskbar .apps i.on { background: #4a5a6e; }
+  #taskbar .tray { position: absolute; right: 22px; top: 0; height: 52px; display: flex; align-items: center; gap: 18px; font-size: 15px; color: var(--fg1); }
+  #trayic { width: 26px; height: 26px; }
+
+  /* act 2: the network */
+  #net { width: 1280px; height: 720px; z-index: 5; }
+  .lane { position: absolute; height: 2px; background: var(--line); border-radius: 1px; }
+  .ln { position: absolute; font-family: var(--mono); font-size: 18px; color: var(--fg2); }
+  .chip { position: absolute; height: 32px; line-height: 32px; padding: 0 14px; border-radius: 16px; font-size: 16px; font-weight: 700; white-space: nowrap; z-index: 2; }
+  .chip.rec { background: var(--coral); color: #fff; }
+  .chip.txt { background: var(--ok); color: var(--ink); }
+  #cloud { width: 116px; height: 116px; border-radius: 50%; background: var(--bg2); display: grid; place-items: center; }
+  #nplate { width: 116px; height: 116px; overflow: visible; }
+  .nl { position: absolute; font-size: 21px; font-weight: 600; white-space: nowrap; }
+  #waitbg, #waitfg { position: absolute; height: 8px; border-radius: 4px; }
+  #waitbg { background: var(--bg3); }
+  #waitfg { background: var(--amber); transform-origin: 0 50%; }
+  #waitn { font-family: var(--mono); font-size: 22px; color: var(--amber); white-space: nowrap; }
+
+  /* act 3: memory */
+  #mem { width: 1280px; height: 720px; z-index: 5; }
+  .row { position: absolute; left: 150px; width: 980px; height: 110px; }
+  .row .nm { position: absolute; left: 0; top: 4px; font-family: var(--disp); font-size: 40px; font-weight: 600; }
+  .row .sb { position: absolute; left: 0; top: 60px; font-size: 19px; color: var(--fg2); }
+  .row .tr { position: absolute; left: 230px; top: 14px; width: 560px; height: 42px; border-radius: 12px; background: var(--bg2); }
+  .row .br { position: absolute; left: 230px; top: 14px; height: 42px; border-radius: 12px; transform-origin: 0 50%; }
+  .row .mb { position: absolute; left: 830px; top: 6px; font-family: var(--disp); font-size: 42px; font-weight: 600; white-space: nowrap; }
+  .row .ps { position: absolute; left: 230px; top: 72px; display: flex; gap: 8px; align-items: center; font-size: 18px; color: var(--fg2); }
+  .row .ps i { width: 16px; height: 16px; border-radius: 5px; display: block; }
+  #memcap { font-size: 18px; color: var(--fg2); white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <!-- act 1 -->
+  <div id="chat" class="a">
+    <div class="hd"><div class="av">К</div><div><div class="nm">Команда</div><div class="st">5 участников</div></div></div>
+    <div class="bub" style="top: 104px">Во сколько завтра созвон?<span class="tm">14:58</span></div>
+    <div class="bub" style="top: 168px">В среду у меня не выходит<span class="tm">14:59</span></div>
+    <div class="bub me" style="top: 244px">Сейчас решим<span class="tm">15:00</span></div>
+    <div id="field"><span id="ph">Сообщение</span><span id="typed"></span><span id="fcaret"></span></div>
+  </div>
+  <div id="wave" class="a"></div>
+  <div id="words" class="a"></div>
+  <div id="dot" class="a c"></div>
+  <div id="timer" class="a"></div>
+  <div id="tsub" class="a">от отпускания до текста</div>
+  <div id="kc" class="a key"><span class="kf a" id="kcf"></span><b>Ctrl</b></div>
+  <div id="kplus" class="a">+</div>
+  <div id="ks" class="a key"><span class="kf a" id="ksf"></span><b>Space</b></div>
+  <div id="taskbar" class="a">
+    <div class="apps"><i></i><i></i><i class="on"></i><i></i><i></i></div>
+    <div class="tray">
+      <span>⌃</span>
+      <svg id="trayic" viewBox="0 0 120 120"><g id="trayg"></g></svg>
+      <span>РУС</span><span>15:00</span>
+    </div>
+  </div>
+
+  <!-- act 2 -->
+  <div id="net" class="a">
+    <svg id="nplate" class="a c" viewBox="0 0 120 120"></svg>
+    <div id="nverba" class="nl a" style="color: var(--fg1)">Verba</div>
+    <div id="cloud" class="a c">
+      <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#aba69f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7.2 18.5h9.6a4.3 4.3 0 0 0 .5-8.57A5.8 5.8 0 0 0 6.2 9.4a4.6 4.6 0 0 0 1 9.1z"/></svg>
+    </div>
+    <div id="nsvc" class="nl a" style="color: var(--fg1)">сервис</div>
+    <div id="lane0" class="lane a"></div><div id="lane1" class="lane a"></div><div id="lane2" class="lane a"></div>
+    <div id="ln0" class="ln a">1</div><div id="ln1" class="ln a">2</div><div id="ln2" class="ln a">3</div>
+    <div id="waitbg" class="a"></div><div id="waitfg" class="a"></div>
+    <div id="waitn" class="a"></div>
+    <div id="p1" class="chip rec a">WAV</div>
+    <div id="p2" class="chip rec a">WAV</div>
+    <div id="r2" class="chip txt a">текст</div>
+    <div id="lnew" class="nl a" style="color: var(--fg1); font-weight: 400">новое соединение</div>
+    <div id="lwin" class="nl a" style="color: var(--ok)">первый ответ — в поле</div>
+    <div id="lcut" class="nl a" style="color: var(--fg2); font-weight: 400">брошена</div>
+  </div>
+
+  <!-- act 3 -->
+  <div id="mem" class="a">
+    <div id="rowh" class="row a">
+      <div class="nm" style="color: var(--fg1)">Handy</div><div class="sb">Tauri, WebView2</div>
+      <div class="tr"></div><div id="brh" class="br" style="width: 560px; background: #5a564f"></div>
+      <div id="mbh" class="mb" style="color: var(--fg1)"></div>
+      <div class="ps" id="psh"></div>
+    </div>
+    <div id="rowv" class="row a">
+      <div class="nm">Verba</div><div class="sb">Rust, Win32</div>
+      <div class="tr"></div><div id="brv" class="br" style="background: var(--coral)"></div>
+      <div id="mbv" class="mb"></div>
+      <div class="ps" id="psv"></div>
+    </div>
+    <div id="memcap" class="a">память в простое · один ПК · 12.11.2026</div>
+  </div>
+
+  <!-- on top -->
+  <div id="lock" class="a">
+    <svg id="plate" viewBox="0 0 120 120"></svg>
+    <div id="word"></div>
+  </div>
+  <div id="motto" class="a"><i id="mo1">VERBA VOLANT,</i> <i id="mo2">SCRIPTA MANENT</i></div>
+  <div id="sep" class="a"></div>
+  <div id="capbox" class="a">
+    <div id="cp1" class="cap a"><span class="n">01</span><span class="t">Держишь Ctrl + Space — <em>говоришь</em></span></div>
+    <div id="cp2" class="cap a"><span class="n">02</span><span class="t">Отпустил — <em>текст в поле за ≈ 1 с</em></span></div>
+    <div id="cp3" class="cap a"><span class="n">03</span><span class="t">Сеть зависла — <em>та же запись по новому соединению</em></span></div>
+    <div id="cp4" class="cap a"><span class="n">04</span><span class="t">В простое — <em>2 МБ и один процесс</em></span></div>
+  </div>
+</div>
+
+<script>
+// ---------- timeline engine (from the README video of QED): every visual property is a pure function of t ----------
+const EASE = {
+  lin: (p) => p,
+  out: (p) => 1 - Math.pow(1 - p, 3),
+  out5: (p) => 1 - Math.pow(1 - p, 5),
+  in: (p) => p * p * p,
+  io: (p) => (p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2),
+  io5: (p) => (p < 0.5 ? 16 * p ** 5 : 1 - (-2 * p + 2) ** 5 / 2),
+  back: (p) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(p - 1, 3) + c1 * Math.pow(p - 1, 2); },
+};
+const tracks = new Map(); // element → { prop → [[time, value, ease]] }
+const frames = []; // (t) => void: waveform, words, counters
+const $ = (id) => document.getElementById(id);
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const prog = (t, t0, d, e = 'io') => EASE[e](clamp((t - t0) / d));
+
+function keysOf(el, prop) {
+  if (!tracks.has(el)) tracks.set(el, {});
+  const tr = tracks.get(el);
+  if (!tr[prop]) tr[prop] = [];
+  return tr[prop];
+}
+function valueAt(keys, t) {
+  if (!keys.length) return undefined;
+  let i = -1;
+  for (let k = 0; k < keys.length && keys[k][0] <= t; k++) i = k;
+  if (i === -1) return keys[0][1];
+  if (i === keys.length - 1) return keys[i][1];
+  const [t0, v0] = keys[i];
+  const [t1, v1, e = 'io'] = keys[i + 1];
+  return t1 === t0 ? v1 : v0 + (v1 - v0) * EASE[e]((t - t0) / (t1 - t0));
+}
+function set(id, t, props) {
+  const el = typeof id === 'string' ? $(id) : id;
+  for (const [k, v] of Object.entries(props)) {
+    const keys = keysOf(el, k);
+    if (keys.length && t > 0) keys.push([t, valueAt(keys, t), 'lin']);
+    keys.push([t, v, 'lin']);
+    keys.sort((a, b) => a[0] - b[0]);
+  }
+}
+function to(id, t, d, props, ease = 'io') {
+  const el = typeof id === 'string' ? $(id) : id;
+  for (const [k, v] of Object.entries(props)) {
+    const keys = keysOf(el, k);
+    const from = valueAt(keys, t);
+    keys.push([t, from ?? v, 'lin'], [t + d, v, ease]);
+    keys.sort((a, b) => a[0] - b[0]);
+  }
+}
+const fadeIn = (id, t, d = 0.35) => { if (!keysOf(typeof id === 'string' ? $(id) : id, 'o').length) set(id, 0, { o: 0 }); to(id, t, d, { o: 1 }, 'out'); };
+const fadeOut = (id, t, d = 0.3) => to(id, t, d, { o: 0 }, 'io');
+const pop = (id, t, d = 0.45) => { set(id, 0, { o: 0, s: 0.6 }); to(id, t, 0.18, { o: 1 }, 'out'); to(id, t, d, { s: 1 }, 'back'); };
+
+function render(t) {
+  for (const [el, tr] of tracks) {
+    const g = (k) => (tr[k] ? valueAt(tr[k], t) : undefined);
+    if (tr.x || tr.y || tr.s || tr.r || tr.sx || tr.sy) {
+      const s = g('s') ?? 1;
+      el.style.transform = `translate(${g('x') ?? 0}px, ${g('y') ?? 0}px) rotate(${g('r') ?? 0}deg) scale(${s * (g('sx') ?? 1)}, ${s * (g('sy') ?? 1)})`;
+    }
+    const o = g('o');
+    if (o !== undefined) { el.style.opacity = o; el.style.visibility = o <= 0.001 ? 'hidden' : 'visible'; }
+    const w = g('w');
+    if (w !== undefined) el.style.width = `${w}px`;
+  }
+  for (const f of frames) f(t);
+}
+
+// ---------- the mark (src/icons.rs, grid 120×120) ----------
+const BARS = [[21.5, 72], [43.5, 50], [65.5, 28]];
+const CARET = [90.5, 8, 88];
+function markSvg(svg, prefix) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const mk = (tag, attrs, parent) => { const e = document.createElementNS(ns, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); parent.appendChild(e); return e; };
+  mk('rect', { width: 120, height: 120, rx: 27, fill: '#E5484D' }, svg);
+  const g = mk('g', { transform: 'translate(60 60) scale(.78) translate(-60 -60)' }, svg);
+  BARS.forEach(([x, h], i) => mk('rect', { id: `${prefix}b${i}`, class: 'fb', x, y: 60 - h / 2, width: 14, height: h, rx: 7, fill: '#fff' }, g));
+  mk('rect', { id: `${prefix}c`, class: 'fb', x: CARET[0], y: 60 - CARET[2] / 2, width: CARET[1], height: CARET[2], rx: 4, fill: '#1b1917' }, g);
+}
+markSvg($('plate'), 'm');
+markSvg($('nplate'), 'n');
+// the tray glyph: the same shapes without the plate, colour by state
+(() => {
+  const ns = 'http://www.w3.org/2000/svg';
+  const g = $('trayg');
+  BARS.forEach(([x, h], i) => { const r = document.createElementNS(ns, 'rect'); Object.entries({ id: `tb${i}`, x: x - 12, y: 60 - h / 2, width: 14, height: h, rx: 7, fill: '#fff' }).forEach(([k, v]) => r.setAttribute(k, v)); g.appendChild(r); });
+  const c = document.createElementNS(ns, 'rect');
+  Object.entries({ x: CARET[0] - 12, y: 60 - CARET[2] / 2 - 4, width: CARET[1] + 2, height: CARET[2] + 8, rx: 5, fill: '#fff' }).forEach(([k, v]) => c.setAttribute(k, v));
+  g.appendChild(c);
+})();
+'Verba'.split('').forEach((ch, i) => { const s = document.createElement('span'); s.id = `l${i}`; s.textContent = ch; $('word').appendChild(s); });
+
+// ---------- the story ----------
+const LOOP = 19.6;
+const REL = 6.0;             // keys released
+const LAND = REL + 1.09;     // text in the field: the measured 1,09 s
+const PHRASE = 'Созвон переносим на четверг, в три — скину ссылку.';
+const WORDS = ['Созвон', 'переносим', 'на', 'четверг,', 'в три', '—', 'скину', 'ссылку'];
+
+function build() {
+  const wordW = $('word').offsetWidth;
+  const LW = 198 + wordW;              // the lockup's width
+  const LY = 236;
+  const CENTER = { x: 640 - LW / 2, y: LY, s: 1 };
+  const ALONE = { x: 640 - 84, y: LY, s: 1 };
+  const CORNER = { x: 48, y: 30, s: 0.25 };
+
+  // --- act 0: the plate with the caret; the voice rises; the word types; the lockup goes to the corner
+  set('lock', 0, ALONE);
+  [0, 1, 2].forEach((i) => {
+    set(`mb${i}`, 0, { sy: 0, o: 0, x: 0 });
+    to(`mb${i}`, 0.35 + i * 0.1, 0.12, { o: 1 }, 'out');
+    to(`mb${i}`, 0.35 + i * 0.1, 0.55, { sy: 1 }, 'back');
+  });
+  set('mc', 0, { sy: 1 });
+  for (let i = 0; i < 5; i++) { set(`l${i}`, 0, { o: 0, y: 10 }); to(`l${i}`, 1.0 + i * 0.07, 0.25, { o: 1, y: 0 }, 'out'); }
+  to('lock', 0.95, 0.55, { x: CENTER.x }, 'io');
+  set('motto', 0, { x: 0, y: LY + 210, o: 0 });
+  set('mo1', 0, { o: 1 }); set('mo2', 0, { o: 1 });
+  to('motto', 1.35, 0.5, { o: 1 }, 'out');
+  to('motto', 2.05, 0.3, { o: 0 });
+  to('lock', 2.15, 0.6, CORNER, 'io5');
+
+  // top bar
+  const capX = CORNER.x + LW * CORNER.s + 44;
+  set('sep', 0, { x: capX - 22, y: 37, o: 0 });
+  set('capbox', 0, { x: capX, y: 26, o: 0 });
+  fadeIn('sep', 2.6); fadeIn('capbox', 2.6);
+  const caps = [['cp1', 2.6], ['cp2', REL], ['cp3', 8.75], ['cp4', 13.75]];
+  caps.forEach(([id, a], i) => {
+    set(id, 0, { y: 46 });
+    to(id, a, 0.38, { y: 0 }, 'io5');
+    const next = caps[i + 1];
+    to(id, next ? next[1] : 16.45, 0.38, { y: -46 }, 'io5');
+  });
+  fadeOut('sep', 16.5); fadeOut('capbox', 16.5);
+
+  // --- act 1: the chat, the voice, the release, the text
+  set('chat', 0, { x: 96, y: 128, o: 0 });
+  to('chat', 2.35, 0.55, { o: 1 }, 'out');
+  set('chat', 2.35, { y: 148 }); to('chat', 2.35, 0.65, { y: 128 }, 'out5');
+  set('taskbar', 0, { x: 0, y: 720 });
+  to('taskbar', 2.4, 0.6, { y: 668 }, 'out5');
+  // keys
+  const KY = 470;
+  set('kc', 0, { x: 828, y: KY }); set('kplus', 0, { x: 912, y: KY + 15 }); set('ks', 0, { x: 944, y: KY });
+  ['kc', 'kplus', 'ks'].forEach((id, i) => { set(id, 0, { o: 0 }); to(id, 2.85 + i * 0.06, 0.3, { o: 1 }, 'out'); });
+  set('kcf', 0, { o: 0 }); set('ksf', 0, { o: 0 });
+  for (const [id, f] of [['kc', 'kcf'], ['ks', 'ksf']]) {
+    to(id, 3.1, 0.08, { y: KY + 4 }, 'out'); to(f, 3.1, 0.08, { o: 1 }, 'out');
+    to(id, REL, 0.12, { y: KY }, 'out'); to(f, REL, 0.15, { o: 0 }, 'out');
+    to(id, REL + 0.7, 0.35, { o: 0 });
+  }
+  to('kplus', REL + 0.7, 0.35, { o: 0 });
+  // the voice: 25 bars, an envelope of speech
+  const NB = 25, WX = 828, WY = 300;
+  set('wave', 0, { x: WX, y: WY });
+  const bars = [];
+  for (let i = 0; i < NB; i++) { const b = document.createElement('div'); b.className = 'wb'; $('wave').appendChild(b); bars.push(b); }
+  const env = (t) => {
+    if (t < 3.12 || t > REL + 0.4) return 0;
+    const on = clamp((t - 3.12) / 0.22) * (t > REL - 0.25 ? clamp((REL - t) / 0.25) : 1);
+    return on * (0.45 + 0.55 * Math.abs(Math.sin(t * 5.3 + 0.4)) * (0.7 + 0.3 * Math.sin(t * 1.7)));
+  };
+  frames.push((t) => {
+    const e = env(t);
+    const conv = prog(t, REL, 0.35, 'io');
+    const show = t >= 3.05 && t < REL + 0.36;
+    bars.forEach((b, i) => {
+      const bell = Math.exp(-(((i - 12) / 7.2) ** 2));
+      const n = 0.55 * Math.abs(Math.sin(i * 0.71 + t * 8.3)) + 0.45 * Math.abs(Math.sin(i * 1.37 - t * 12.1 + 1.3));
+      let h = 8 + 132 * e * bell * n;
+      h = 8 + (h - 8) * (1 - conv);
+      const x = i * 14 * (1 - conv) + 12 * 14 * conv;
+      b.style.height = `${h}px`;
+      b.style.transform = `translate(${x}px, ${-h / 2}px)`;
+      b.style.opacity = show ? (t < 3.2 ? clamp((t - 3.05) / 0.15) : 1) : 0;
+    });
+  });
+  // words fly away (verba volant)
+  const wStart = (i) => 3.3 + i * 0.31;
+  WORDS.forEach((w, i) => {
+    const el = document.createElement('div'); el.className = 'wd'; el.textContent = w; $('words').appendChild(el);
+    const dx = [-60, 50, -20, 70, -80, 30, -40, 60][i];
+    frames.push((t) => {
+      const p = (t - wStart(i)) / 1.8;
+      if (p <= 0 || p >= 1) { el.style.opacity = 0; return; }
+      const wv = el.offsetWidth;
+      el.style.opacity = p < 0.12 ? p / 0.12 : Math.pow(1 - (p - 0.12) / 0.88, 1.4);
+      el.style.transform = `translate(${WX + 172 + dx * EASE.out(p) - wv / 2}px, ${WY - 40 - 150 * EASE.out(p)}px) scale(${1 - 0.15 * p})`;
+    });
+  });
+  // the dot: the voice collapses and flies into the field's caret
+  const FX = 96 + 20 + 20, FY = 128 + 400 + 28; // the text start inside the field, stage coords
+  frames.push((t) => {
+    const d = $('dot');
+    const p = prog(t, REL + 0.33, 0.55, 'io');
+    const on = t >= REL + 0.3 && t < REL + 0.92;
+    const x0 = WX + 172, y0 = WY, x1 = FX, y1 = FY;
+    const x = x0 + (x1 - x0) * p, y = y0 + (y1 - y0) * p - 120 * Math.sin(Math.PI * p);
+    const s = 1 - 0.55 * prog(t, REL + 0.78, 0.12, 'in');
+    d.style.opacity = on ? 1 : 0;
+    d.style.transform = `translate(${x - 9}px, ${y - 9}px) scale(${s})`;
+  });
+  // the field: placeholder, then the text slides in at the caret
+  frames.push((t) => {
+    const r = prog(t, LAND - 0.08, 0.32, 'out');
+    $('typed').textContent = t >= LAND - 0.08 ? PHRASE : '';
+    $('ph').style.opacity = t >= LAND - 0.08 ? 0 : 1;
+    const full = $('typed').offsetWidth;
+    $('typed').style.clipPath = `inset(0 ${(1 - r) * 100}% 0 0)`;
+    $('fcaret').style.left = `${20 + full * r + 2}px`;
+    const blink = Math.round(t * 100) % 106 < 53;
+    const busy = t > REL + 0.8 && t < LAND + 0.5;
+    $('fcaret').style.opacity = busy || blink ? 1 : 0;
+  });
+  // the timer where the voice was
+  set('timer', 0, { x: WX, y: WY - 60, o: 0 }); set('tsub', 0, { x: WX, y: WY + 40, o: 0 });
+  to('timer', REL + 0.25, 0.25, { o: 1 }, 'out'); to('tsub', REL + 0.35, 0.3, { o: 1 }, 'out');
+  frames.push((t) => {
+    const v = clamp(t - REL, 0, 1.09);
+    $('timer').innerHTML = `${v.toFixed(2).replace('.', ',')}<small>с</small>`;
+    $('timer').style.color = t >= LAND ? 'var(--ok)' : 'var(--fg0)';
+  });
+  // the tray icon: white → red while you talk → amber while it is recognised → white
+  frames.push((t) => {
+    const col = t >= 3.1 && t < REL ? '#E5484D' : t >= REL && t < LAND ? '#F5A524' : '#ffffff';
+    for (let i = 0; i < 3; i++) $(`tb${i}`).setAttribute('fill', col);
+  });
+  // act 1 leaves
+  for (const id of ['chat', 'timer', 'tsub']) fadeOut(id, 8.35, 0.35);
+  to('chat', 8.35, 0.4, { y: 112 }, 'io');
+  to('taskbar', 8.35, 0.45, { y: 720 }, 'io');
+
+  // --- act 2: the network
+  const XA = 300, XB = 980, LY0 = 330, LG = 82;
+  set('net', 0, { o: 0 }); to('net', 8.6, 0.3, { o: 1 }, 'out'); to('net', 13.45, 0.35, { o: 0 });
+  set('nplate', 0, { x: 120, y: LY0 + LG - 58 }); pop('nplate', 8.7);
+  set('nverba', 0, { x: 140, y: LY0 + LG + 72, o: 0 }); fadeIn('nverba', 8.9);
+  set('cloud', 0, { x: 1044, y: LY0 + LG - 58 }); pop('cloud', 8.8);
+  set('nsvc', 0, { x: 1068, y: LY0 + LG + 72, o: 0 }); fadeIn('nsvc', 9.0);
+  [0, 1, 2].forEach((i) => {
+    set(`lane${i}`, 0, { x: XA, y: LY0 + i * LG, w: 0 }); to(`lane${i}`, 8.85 + i * 0.08, 0.45, { w: XB - XA }, 'io');
+    set(`ln${i}`, 0, { x: XA - 30, y: LY0 + i * LG - 12, o: 0 }); fadeIn(`ln${i}`, 8.9 + i * 0.08);
+  });
+  const chip = (id, lane, x) => set(id, 0, { x: x - 30, y: LY0 + lane * LG - 16 });
+  const HANG = 560;
+  chip('p1', 0, XA); set('p1', 0, { o: 0 }); fadeIn('p1', 9.3, 0.15);
+  to('p1', 9.3, 0.55, { x: HANG - 30 }, 'out5');
+  set('waitbg', 0, { x: HANG + 40, y: LY0 - 44, w: 330, o: 0 }); fadeIn('waitbg', 9.75, 0.2);
+  set('waitfg', 0, { x: HANG + 40, y: LY0 - 44, w: 330, sx: 0, o: 0 }); fadeIn('waitfg', 9.75, 0.2);
+  to('waitfg', 9.9, 1.6, { sx: 1 }, 'lin');
+  set('waitn', 0, { x: HANG + 390, y: LY0 - 58, o: 0 }); fadeIn('waitn', 9.9, 0.2);
+  frames.push((t) => {
+    const n = clamp(Math.floor((t - 9.9) / 0.4) + 1, 0, 4);
+    $('waitn').textContent = n >= 4 ? '4 с без ответа' : `${n} с`;
+  });
+  chip('p2', 1, XA); set('p2', 0, { o: 0 }); fadeIn('p2', 11.55, 0.12);
+  to('p2', 11.55, 0.65, { x: XB - 30 }, 'io');
+  to('p2', 12.18, 0.1, { o: 0 });
+  set('lnew', 0, { x: XA + 4, y: LY0 + LG - 46, o: 0 }); fadeIn('lnew', 11.5, 0.2); fadeOut('lnew', 12.3, 0.25);
+  set('cloud', 12.2, { s: 1 }); to('cloud', 12.2, 0.12, { s: 1.08 }, 'out'); to('cloud', 12.32, 0.25, { s: 1 }, 'out');
+  chip('r2', 1, XB); set('r2', 0, { o: 0 }); fadeIn('r2', 12.28, 0.12);
+  to('r2', 12.28, 0.55, { x: XA - 30 }, 'io');
+  to('r2', 12.82, 0.1, { o: 0 });
+  set('nplate', 12.85, { s: 1 }); to('nplate', 12.85, 0.12, { s: 1.1 }, 'out'); to('nplate', 12.97, 0.3, { s: 1 }, 'out');
+  set('lwin', 0, { x: XB - 250, y: LY0 + LG - 46, o: 0 }); fadeIn('lwin', 12.85, 0.25);
+  to('p1', 12.95, 0.3, { o: 0.25 });
+  set('lcut', 0, { x: HANG - 20, y: LY0 + 22, o: 0 }); fadeIn('lcut', 13.0, 0.25);
+  to('lane0', 12.95, 0.3, { o: 0.35 });
+
+  // --- act 3: memory at rest
+  set('mem', 0, { o: 0 }); to('mem', 13.7, 0.3, { o: 1 }, 'out'); to('mem', 16.25, 0.35, { o: 0 });
+  set('rowh', 0, { y: 250 }); set('rowv', 0, { y: 390 });
+  set('memcap', 0, { x: 150, y: 540, o: 0 }); fadeIn('memcap', 14.6, 0.4);
+  const MB = { h: 286, v: 2 };
+  set('brh', 0, { sx: 0 }); to('brh', 13.9, 1.0, { sx: 1 }, 'out5');
+  set('brv', 0, { w: Math.max(16, 560 * MB.v / MB.h), sx: 0 }); to('brv', 14.5, 0.6, { sx: 1 }, 'back');
+  for (const [k, id, n, col, t0] of [['h', 'psh', 8, '#5a564f', 14.2], ['v', 'psv', 1, '#E5484D', 14.8]]) {
+    for (let i = 0; i < n; i++) {
+      const sq = document.createElement('i'); sq.style.background = col; sq.id = `${id}${i}`; $(id).appendChild(sq);
+      pop(sq, t0 + i * 0.06, 0.35);
+    }
+    const lab = document.createElement('span'); lab.textContent = n === 1 ? '1 процесс' : `${n} процессов`; lab.id = `${id}l`; $(id).appendChild(lab);
+    fadeIn(lab, t0 + n * 0.06 + 0.1, 0.3);
+  }
+  frames.push((t) => {
+    $('mbh').textContent = `${Math.round(MB.h * prog(t, 13.9, 1.0, 'out5'))} МБ`;
+    $('mbv').textContent = `${Math.round(MB.v * prog(t, 14.5, 0.5, 'out'))} МБ`;
+  });
+
+  // --- act 4: back to the mark; the voice flies into the caret, the caret stays
+  to('lock', 16.5, 0.75, CENTER, 'io5');
+  [2, 1, 0].forEach((i, k) => {
+    const fly = (CARET[0] - BARS[i][0]) * 0.92;
+    const t0 = 17.75 + k * 0.1;
+    to(`mb${i}`, t0, 0.45, { x: fly, sy: 0.15 }, 'in');
+    to(`mb${i}`, t0 + 0.25, 0.2, { o: 0 }, 'lin');
+  });
+  set('mc', 18.2, { sy: 1 }); to('mc', 18.2, 0.12, { sy: 1.14 }, 'out'); to('mc', 18.32, 0.35, { sy: 1 }, 'out');
+  set('motto', 17.35, { o: 0 });
+  to('motto', 17.4, 0.4, { o: 1 }, 'out');
+  set('mo2', 0, { o: 1 }); set('mo2', 17.3, { o: 0 }); to('mo2', 18.25, 0.35, { o: 1 }, 'out');
+  set('mo1', 17.3, { o: 1 }); to('mo1', 18.3, 0.5, { o: 0.25 }, 'io');
+  for (let i = 4; i >= 0; i--) to(`l${i}`, 18.35 + (4 - i) * 0.05, 0.2, { o: 0, y: 0 }, 'in');
+  to('lock', 18.55, 0.6, ALONE, 'io5');
+  to('motto', 18.95, 0.4, { o: 0 });
+  [0, 1, 2].forEach((i) => set(`mb${i}`, LOOP - 0.01, { x: 0, sy: 0, o: 0 }));
+}
+
+let built = false;
+const ready = document.fonts.ready.then(() => { build(); built = true; render(0); return true; });
+window.VERBA_INTRO = { duration: LOOP, loop: LOOP, render, ready };
+
+// opened in a browser: play by itself
+if (!location.search.includes('render')) {
+  ready.then(() => {
+    const t0 = performance.now();
+    const tick = (now) => { render(((now - t0) / 1000) % LOOP); requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+  });
+}
+</script>
+</body>
+</html>
