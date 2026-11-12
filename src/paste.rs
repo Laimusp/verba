@@ -10,10 +10,15 @@
 //!    возвращается, если буфер с тех пор никто не менял (номер последовательности буфера);
 //! 4. маркеры `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory = 0`,
 //!    `CanUploadToCloudClipboard = 0`: текст диктовки не попадает в журнал Win+V и облако.
+//!
+//! Вставка «на взводе» (`paste_armed`) — для вставки в запомненное поле (`target`): шаги 1–2 до
+//! перевода чужого окна вперёд, Ctrl+V — по команде `Armed::fire`; вехи (Ctrl+V ушёл, первое
+//! чтение) говорят, когда можно вернуть фокус человеку.
 
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::Sender;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{GlobalFree, SetLastError, ERROR_SUCCESS, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{
@@ -30,10 +35,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_CONTROL, VK_INSERT, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CopyImage, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowLongPtrW, KillTimer,
-    PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, GDI_IMAGE_TYPE, GWLP_USERDATA, HWND_MESSAGE, IMAGE_FLAGS,
-    MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROYCLIPBOARD, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
+    CopyImage, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW, GetMessageW,
+    GetWindowLongPtrW, GetWindowThreadProcessId, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, SetTimer,
+    SetWindowLongPtrW, GDI_IMAGE_TYPE, GWLP_USERDATA, HWND_MESSAGE, IMAGE_FLAGS, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_DESTROYCLIPBOARD, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
 };
 
 use crate::config::PasteMethod;
@@ -46,21 +53,72 @@ const RESTORE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Ctrl+V не ушёл — квитанции не будет, возвращаем быстро.
 const FAILED_INJECTION_TIMEOUT: Duration = Duration::from_millis(500);
 /// Удержание сочетания: слишком быстрое Ctrl+V некоторые системы теряли (Handy #165).
+/// Вставка на взводе отпускает клавиши раньше — как только приложение прочитало буфер: значит,
+/// Ctrl+V оно уже увидело, а чужое окно впереди лишние ~90 мс не держится.
 const CHORD_HOLD_MS: u64 = 100;
 /// Модификаторы человека (Alt от Ctrl+Alt+V) испортили бы наш Ctrl+V — ждём отпускания столько.
 const MODIFIERS_WAIT: Duration = Duration::from_millis(1500);
 const MAX_FORMAT_BYTES: usize = 64 * 1024 * 1024;
 const TIMER_ID: usize = 1;
 const TIMER_INTERVAL_MS: u32 = 25;
+/// Вставка на взводе не дождалась команды — буфер возвращается человеку.
+const ARM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Команда окну транзакции: wParam 1 — жать Ctrl+V, 0 — отмена.
+const WM_GO: u32 = WM_APP + 7;
+const CLASS_NAME: &str = "VerbaPasteTx";
 
 #[derive(Debug, Clone)]
 pub struct PasteReport {
-    /// от начала вставки до отправки Ctrl+V (включая ожидание модификаторов)
+    /// от начала вставки до отправки Ctrl+V (включая ожидание модификаторов и команды «жать»)
     pub chord_ms: u64,
     /// приложение прочитало буфер через столько после Ctrl+V; None — не прочитало
     pub read_ms: Option<u64>,
     pub restored: bool,
     pub error: Option<String>,
+    /// вставку на взводе отменил тот, кто её взвёл: Ctrl+V не нажимался
+    pub aborted: bool,
+}
+
+/// Вехи вставки — для того, кто держит чужое окно впереди, пока идёт Ctrl+V (`target`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Milestone {
+    /// буфер готов, ждём команды (`Armed`); число — окно транзакции
+    Ready(isize),
+    /// Ctrl+V отправлен целиком: нажатие и отпускание
+    ChordSent,
+    ChordFailed,
+    /// приложение впервые прочитало буфер после Ctrl+V
+    FirstRead,
+    /// транзакция кончилась, итог ушёл в `done`
+    Ended,
+}
+
+/// Вставка на взводе: буфер уже подготовлен, Ctrl+V — по команде.
+pub struct Armed(isize);
+
+impl Armed {
+    pub fn new(tx_window: isize) -> Self {
+        Armed(tx_window)
+    }
+    pub fn fire(&self) {
+        self.post(1);
+    }
+    pub fn cancel(&self) {
+        self.post(0);
+    }
+    fn post(&self, go: usize) {
+        let hwnd = HWND(self.0 as *mut _);
+        // окно транзакции могло закрыться, а его номер — достаться чужому окну: шлём только своему
+        let mut pid = 0;
+        let mut class = [0u16; 32];
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            let n = GetClassNameW(hwnd, &mut class).max(0) as usize;
+            if pid == GetCurrentProcessId() && String::from_utf16_lossy(&class[..n]) == CLASS_NAME {
+                let _ = PostMessageW(Some(hwnd), WM_GO, WPARAM(go), LPARAM(0));
+            }
+        }
+    }
 }
 
 struct TxState {
@@ -70,6 +128,10 @@ struct TxState {
     receipts: Vec<Instant>,
     ownership_lost: bool,
     cancelled: bool,
+    /// ждёт команды «жать» (вставка на взводе)
+    armed: bool,
+    aborted: bool,
+    first_read_sent: bool,
 }
 
 impl TxState {
@@ -81,6 +143,9 @@ impl TxState {
             receipts: Vec::new(),
             ownership_lost: false,
             cancelled: false,
+            armed: false,
+            aborted: false,
+            first_read_sent: false,
         }
     }
     fn last_receipt_after_injection(&self) -> Option<Instant> {
@@ -96,6 +161,9 @@ impl TxState {
 fn should_finish(s: &TxState, now: Instant) -> bool {
     if s.ownership_lost || s.cancelled {
         return true;
+    }
+    if s.armed && s.injected_at.is_none() {
+        return now.duration_since(s.published_at) >= ARM_TIMEOUT;
     }
     if let Some(last) = s.last_receipt_after_injection() {
         if now.duration_since(last) >= QUIET_PERIOD {
@@ -119,10 +187,38 @@ struct Shared {
     snapshot: Mutex<Vec<SavedFormat>>,
     saved_bitmap: Mutex<Option<usize>>,
     sequence: Mutex<u32>,
+    /// вернуть прежнее содержимое буфера
     restore: bool,
+    /// текст «обещанием» и ждать квитанций чтения (нужно возврату буфера и вехам)
+    wait_reads: bool,
+    /// Ctrl+V — только по команде `Armed::fire`
+    armed: bool,
+    method: PasteMethod,
+    watch: Option<Sender<Milestone>>,
+    /// первое чтение после Ctrl+V — сигнал отпустить клавиши (вставка на взводе)
+    first_read: (Mutex<bool>, Condvar),
     started: Instant,
     chord_ms: Mutex<u64>,
     done: Mutex<Option<Done>>,
+}
+
+impl Shared {
+    /// Держать Ctrl+V: на взводе — до первого чтения буфера, но не дольше `CHORD_HOLD_MS`.
+    fn hold_chord(&self) {
+        let max = Duration::from_millis(CHORD_HOLD_MS);
+        if !self.armed {
+            return std::thread::sleep(max);
+        }
+        let (lock, cv) = &self.first_read;
+        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = cv.wait_timeout_while(guard, max, |read| !*read);
+    }
+
+    fn note(&self, m: Milestone) {
+        if let Some(w) = &self.watch {
+            let _ = w.send(m);
+        }
+    }
 }
 
 /// Транзакция, которая сейчас держит буфер: новая вставка сначала завершает её.
@@ -283,7 +379,7 @@ unsafe fn publish(hwnd: HWND, shared: &Shared) -> Result<u32, String> {
     let result = (|| {
         EmptyClipboard().map_err(|e| format!("EmptyClipboard: {e}"))?;
         set_private_markers();
-        if shared.restore {
+        if shared.wait_reads {
             // NULL — отложенная отдача; успех тоже NULL, ошибку видно только по GetLastError
             SetLastError(ERROR_SUCCESS);
             if let Err(e) = SetClipboardData(u32::from(CF_UNICODETEXT.0), None) {
@@ -308,11 +404,38 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_RENDERFORMAT => {
             if !shared.is_null() {
                 let shared = &*shared;
+                let mut first = false;
                 if let Ok(mut st) = shared.state.lock() {
-                    st.receipts.push(Instant::now());
+                    let now = Instant::now();
+                    st.receipts.push(now);
+                    if !st.first_read_sent && st.injected_at.is_some_and(|i| now >= i) {
+                        st.first_read_sent = true;
+                        first = true;
+                        let (lock, cv) = &shared.first_read;
+                        *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                        cv.notify_all();
+                    }
                 }
                 if wparam.0 as u32 == u32::from(CF_UNICODETEXT.0) {
                     render_text(&shared.text);
+                }
+                if first {
+                    shared.note(Milestone::FirstRead);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_GO => {
+            if !shared.is_null() {
+                if wparam.0 == 1 {
+                    // указатель живёт, пока живо окно; свой Arc — для потока Ctrl+V
+                    Arc::increment_strong_count(shared);
+                    start_chord(&Arc::from_raw(shared));
+                } else if let Ok(mut st) = (*shared).state.lock() {
+                    if st.injected_at.is_none() {
+                        st.cancelled = true;
+                        st.aborted = true;
+                    }
                 }
             }
             LRESULT(0)
@@ -357,13 +480,49 @@ fn settle(shared: &Shared) -> bool {
 }
 
 fn report(shared: &Shared, restored: bool, error: Option<String>) {
-    let read_ms = shared.state.lock().ok().and_then(|s| {
-        let injected = s.injected_at?;
-        Some(s.first_receipt_after_injection()?.duration_since(injected).as_millis() as u64)
-    });
+    let (read_ms, aborted) = shared
+        .state
+        .lock()
+        .map(|s| {
+            let read = s.injected_at.and_then(|i| Some(s.first_receipt_after_injection()?.duration_since(i).as_millis() as u64));
+            (read, s.aborted)
+        })
+        .unwrap_or((None, false));
     let chord_ms = *shared.chord_ms.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(done) = shared.done.lock().ok().and_then(|mut d| d.take()) {
-        done(PasteReport { chord_ms, read_ms, restored, error });
+        done(PasteReport { chord_ms, read_ms, restored, error, aborted });
+        shared.note(Milestone::Ended);
+    }
+}
+
+/// Ctrl+V — из отдельного потока: поток транзакции должен качать сообщения, пока приложение
+/// читает буфер. Второй вызов ничего не делает.
+fn start_chord(shared: &Arc<Shared>) {
+    if let Ok(mut st) = shared.state.lock() {
+        if st.injected_at.is_some() || st.cancelled {
+            return;
+        }
+        st.published_at = Instant::now();
+        // отметка до отправки: быстрое приложение читает, пока сочетание ещё нажато
+        st.injected_at = Some(Instant::now());
+    }
+    *shared.chord_ms.lock().unwrap_or_else(|p| p.into_inner()) = shared.started.elapsed().as_millis() as u64;
+    let chord_shared = shared.clone();
+    let spawned = std::thread::Builder::new().name("verba-chord".into()).spawn(move || match send_chord(chord_shared.method, || chord_shared.hold_chord()) {
+        Ok(()) => chord_shared.note(Milestone::ChordSent),
+        Err(e) => {
+            crate::warn!("вставка: {e}");
+            if let Ok(mut st) = chord_shared.state.lock() {
+                st.injection_failed = true;
+            }
+            chord_shared.note(Milestone::ChordFailed);
+        }
+    });
+    if spawned.is_err() {
+        if let Ok(mut st) = shared.state.lock() {
+            st.injection_failed = true;
+        }
+        shared.note(Milestone::ChordFailed);
     }
 }
 
@@ -373,6 +532,10 @@ fn on_timer(shared: &Shared) {
             let f = should_finish(&st, Instant::now());
             if f {
                 st.cancelled = true;
+                // взвели и не нажали — вставки не было
+                if st.armed && st.injected_at.is_none() {
+                    st.aborted = true;
+                }
             }
             f
         }
@@ -397,6 +560,9 @@ fn flush_pending() {
     if let Some(prev) = previous {
         if let Ok(mut st) = prev.state.lock() {
             st.cancelled = true;
+            if st.armed && st.injected_at.is_none() {
+                st.aborted = true;
+            }
         }
         let restored = settle(&prev);
         report(&prev, restored, None);
@@ -406,6 +572,7 @@ fn flush_pending() {
 fn ensure_class(hinst: HINSTANCE) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        // имя — то же, что CLASS_NAME (по нему Armed узнаёт своё окно)
         let wc =
             WNDCLASSW { lpfnWndProc: Some(wnd_proc), hInstance: hinst, lpszClassName: w!("VerbaPasteTx"), ..Default::default() };
         unsafe {
@@ -422,7 +589,7 @@ fn user_modifiers_held() -> bool {
     [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN].into_iter().any(held)
 }
 
-fn send_chord(method: PasteMethod) -> Result<(), String> {
+fn send_chord(method: PasteMethod, hold: impl FnOnce()) -> Result<(), String> {
     const VK_V: u16 = 0x56;
     let (mods, key): (&[VIRTUAL_KEY], VIRTUAL_KEY) = match method {
         PasteMethod::CtrlV => (&[VK_CONTROL], VIRTUAL_KEY(VK_V)),
@@ -447,7 +614,7 @@ fn send_chord(method: PasteMethod) -> Result<(), String> {
     let size = std::mem::size_of::<INPUT>() as i32;
     let down: Vec<INPUT> = mods.iter().map(|m| ev(*m, false)).chain(std::iter::once(ev(key, false))).collect();
     let sent = unsafe { SendInput(&down, size) } as usize;
-    std::thread::sleep(Duration::from_millis(CHORD_HOLD_MS));
+    hold();
     let up: Vec<INPUT> = std::iter::once(ev(key, true)).chain(mods.iter().rev().map(|m| ev(*m, true))).collect();
     let sent_up = unsafe { SendInput(&up, size) } as usize;
     if sent != down.len() || sent_up != up.len() {
@@ -461,6 +628,22 @@ fn send_chord(method: PasteMethod) -> Result<(), String> {
 
 /// Вставить текст в окно с фокусом. Возвращается сразу; итог — в `done` (из потока вставки).
 pub fn paste(text: String, method: PasteMethod, restore: bool, done: impl FnOnce(PasteReport) + Send + 'static) {
+    start(text, method, restore, None, false, Box::new(done));
+}
+
+/// Вставка на взводе: снимок и публикация буфера сейчас, Ctrl+V — по `Armed::fire` (окно транзакции
+/// приходит вехой `Ready`). Без команды за 5 с — отмена, буфер возвращается. Вехи — в `watch`.
+pub fn paste_armed(
+    text: String,
+    method: PasteMethod,
+    restore: bool,
+    watch: Sender<Milestone>,
+    done: impl FnOnce(PasteReport) + Send + 'static,
+) {
+    start(text, method, restore, Some(watch), true, Box::new(done));
+}
+
+fn start(text: String, method: PasteMethod, restore: bool, watch: Option<Sender<Milestone>>, armed: bool, done: Done) {
     let shared = Arc::new(Shared {
         state: Mutex::new(TxState::new()),
         text: wide(&text),
@@ -468,20 +651,26 @@ pub fn paste(text: String, method: PasteMethod, restore: bool, done: impl FnOnce
         saved_bitmap: Mutex::new(None),
         sequence: Mutex::new(0),
         restore,
+        // вехам нужны квитанции чтения — текст тогда тоже «обещанием»
+        wait_reads: restore || watch.is_some(),
+        armed,
+        method,
+        watch,
+        first_read: (Mutex::new(false), Condvar::new()),
         started: Instant::now(),
         chord_ms: Mutex::new(0),
-        done: Mutex::new(Some(Box::new(done))),
+        done: Mutex::new(Some(done)),
     });
     let spawned = std::thread::Builder::new().name("verba-paste".into()).spawn({
         let shared = shared.clone();
-        move || unsafe { pump(shared, method) }
+        move || unsafe { pump(shared) }
     });
     if let Err(e) = spawned {
         report(&shared, false, Some(format!("поток вставки не запустился: {e}")));
     }
 }
 
-unsafe fn pump(shared: Arc<Shared>, method: PasteMethod) {
+unsafe fn pump(shared: Arc<Shared>) {
     // модификаторы человека (Ctrl+Alt+V «вставить последнее») — дождаться отпускания
     let wait_until = Instant::now() + MODIFIERS_WAIT;
     while user_modifiers_held() && Instant::now() < wait_until {
@@ -534,26 +723,19 @@ unsafe fn pump(shared: Arc<Shared>, method: PasteMethod) {
         }
     };
     *shared.sequence.lock().unwrap_or_else(|p| p.into_inner()) = sequence;
-    if let Ok(mut st) = shared.state.lock() {
-        st.published_at = Instant::now();
-        // отметка до отправки: быстрое приложение читает, пока сочетание ещё нажато
-        st.injected_at = Some(Instant::now());
-    }
-    *shared.chord_ms.lock().unwrap_or_else(|p| p.into_inner()) = shared.started.elapsed().as_millis() as u64;
     if let Ok(mut slot) = PENDING.lock() {
         *slot = Some(shared.clone());
     }
-    // Ctrl+V — из отдельного потока: этот должен качать сообщения, пока приложение читает буфер
-    let chord_shared = shared.clone();
-    let _ = std::thread::Builder::new().name("verba-chord".into()).spawn(move || {
-        if let Err(e) = send_chord(method) {
-            crate::warn!("вставка: {e}");
-            if let Ok(mut st) = chord_shared.state.lock() {
-                st.injection_failed = true;
-            }
+    if shared.armed {
+        if let Ok(mut st) = shared.state.lock() {
+            st.armed = true;
+            st.published_at = Instant::now();
         }
-    });
-    if !shared.restore {
+        shared.note(Milestone::Ready(hwnd.0 as isize));
+    } else {
+        start_chord(&shared);
+    }
+    if !shared.wait_reads {
         // текст остаётся в буфере целиком (не обещанием): ждать квитанций незачем
         std::thread::sleep(Duration::from_millis(CHORD_HOLD_MS + 50));
         teardown(hwnd);
@@ -568,6 +750,7 @@ unsafe fn pump(shared: Arc<Shared>, method: PasteMethod) {
         DispatchMessageW(&msg);
     }
     let _ = KillTimer(Some(hwnd), TIMER_ID);
+    // без возврата буфера невыполненное обещание отдаётся текстом здесь (WM_RENDERALLFORMATS)
     teardown(hwnd);
 }
 
@@ -647,6 +830,21 @@ mod tests {
         s.receipts.push(now - Duration::from_millis(280));
         s.injected_at = Some(now - Duration::from_millis(250));
         assert!(!should_finish(&s, now), "менеджер буфера прочитал до Ctrl+V — это не вставка");
+    }
+
+    #[test]
+    fn armed_waits_for_command_then_gives_clipboard_back() {
+        let now = Instant::now();
+        let mut s = TxState::new();
+        s.armed = true;
+        s.published_at = now - Duration::from_millis(900);
+        assert!(!should_finish(&s, now), "взведена, команды ещё нет — ждём");
+        assert!(should_finish(&s, now + ARM_TIMEOUT), "команды нет 5 с — буфер человеку");
+        s.injected_at = Some(now);
+        s.published_at = now;
+        s.receipts.push(now + Duration::from_millis(10));
+        assert!(!should_finish(&s, now + Duration::from_millis(100)), "нажали, читают — ждём");
+        assert!(should_finish(&s, now + Duration::from_millis(10) + QUIET_PERIOD));
     }
 
     #[test]

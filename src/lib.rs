@@ -14,4 +14,5 @@ pub mod net;
 pub mod paste;
 pub mod secrets;
 pub mod sound;
+pub mod target;
 pub mod tray;

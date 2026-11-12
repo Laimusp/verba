@@ -5,6 +5,7 @@
 - Сочетание с Alt или Win, проглоченное хуком, открыло бы меню окна или «Пуск» — Verba гасит это пустым нажатием неназначенной клавиши.
 - Вставка: буфер с отложенной отдачей даёт квитанцию о прочтении; после неё прежнее содержимое возвращается. Текст диктовки не попадает в журнал Win+V и облако.
 - Окно с правами администратора: Verba без прав в него не вставит, и Windows об этом не сообщает.
+- Вставка в окно, которое уже не впереди: обходы и замеры — `docs/focus-restore.md`.
 - Каждый пункт ниже: что, источник, проверено ли на живой системе (12.11.2026, Windows 11 Pro 26100).
 
 ## Хук WH_KEYBOARD_LL снимается молча
@@ -64,3 +65,4 @@
 - **Что:** `SetForegroundWindow` из фонового процесса запрещён (foreground lock); работает после `AttachThreadInput` к потоку переднего окна.
 - **Источник:** [SetForegroundWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow), [AttachThreadInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-attachthreadinput).
 - **Проверено:** тестовое окно встаёт вперёд. Приём пригодится T-003 «Вставка в запомненное поле».
+- **T-003:** первым приёмом оказалось пустое событие мыши через `SendInput` (PowerToys) — сработало во всех попытках, `AttachThreadInput` остался запасным. Обходы вставки в запомненное поле (foreground lock, `EM_REPLACESEL`, первый запрос UIA к Chrome, протухший RuntimeId) и замеры — `docs/focus-restore.md`.

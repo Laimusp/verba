@@ -180,12 +180,34 @@ pub struct Paste {
     pub trailing_space: bool,
     /// вернуть прежнее содержимое буфера обмена после вставки
     pub restore_clipboard: bool,
+    /// вставлять в поле, где был курсор при нажатии хоткея, даже если фокус потом ушёл в другое
+    /// окно (`docs/focus-restore.md`); выключено — вставка туда, где фокус сейчас
+    pub remember_field: bool,
+    /// exe игр (`game.exe`, как в Диспетчере задач): фокус в них не возвращается — Ctrl+V в игру
+    /// с закрытым чатом стал бы нажатиями игровых клавиш. Полноэкранное окно — игра и без списка
+    pub games: Vec<String>,
 }
 
 impl Default for Paste {
     fn default() -> Self {
-        Self { method: PasteMethod::CtrlV, trailing_space: true, restore_clipboard: true }
+        Self {
+            method: PasteMethod::CtrlV,
+            trailing_space: true,
+            restore_clipboard: true,
+            remember_field: true,
+            games: Vec::new(),
+        }
     }
+}
+
+/// `Game`, ` game.EXE ` → `game.exe`: так сравнивается с именем процесса.
+fn normalize_exe(name: &str) -> Option<String> {
+    let n = name.trim().trim_matches('"').to_lowercase();
+    let n = n.rsplit(['\\', '/']).next().unwrap_or("").to_string();
+    if n.is_empty() {
+        return None;
+    }
+    Some(if n.contains('.') { n } else { format!("{n}.exe") })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -273,6 +295,13 @@ impl Config {
         self.microphone.prebuffer_ms = self.microphone.prebuffer_ms.min(2000);
         self.hotkeys.hybrid_hold_ms = self.hotkeys.hybrid_hold_ms.clamp(100, 2000);
         self.history_size = self.history_size.clamp(1, 50);
+        let mut games: Vec<String> = Vec::new();
+        for g in self.paste.games.iter().filter_map(|g| normalize_exe(g)) {
+            if !games.contains(&g) {
+                games.push(g);
+            }
+        }
+        self.paste.games = games;
         self.openrouter.models.retain(|m| !m.trim().is_empty());
         if self.openrouter.model.trim().is_empty() {
             self.openrouter.model = self.openrouter.models.first().cloned().unwrap_or_else(|| OpenRouter::default().model);
@@ -431,6 +460,17 @@ mod tests {
         c.openrouter.model = "x/y".into();
         c.validate().unwrap();
         assert_eq!(c.openrouter.models[0], "x/y");
+    }
+
+    #[test]
+    fn remembered_field_is_on_by_default_and_games_normalized() {
+        let mut c: Config = serde_json::from_str(r#"{"paste": {"games": [" CS2.EXE ", "dota2", "", "C:\\Games\\x.exe"]}}"#).unwrap();
+        c.validate().unwrap();
+        assert!(c.paste.remember_field, "старый файл без поля — включено");
+        assert_eq!(c.paste.games, ["cs2.exe", "dota2.exe", "x.exe"]);
+        let mut off: Config = serde_json::from_str(r#"{"paste": {"remember_field": false}}"#).unwrap();
+        off.validate().unwrap();
+        assert!(!off.paste.remember_field);
     }
 
     #[test]

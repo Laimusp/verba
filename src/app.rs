@@ -17,6 +17,7 @@ use crate::controller::{Channels, Controller, Parts};
 use crate::hotkey::hook::{HookThread, MATCHER};
 use crate::net::service::NetService;
 use crate::net::Route;
+use crate::target::TargetService;
 use crate::tray::{self, UiState};
 use crate::{error, info, logger, warn};
 
@@ -109,6 +110,14 @@ pub fn run() -> i32 {
         }
     };
     let (paste_tx, paste_rx) = crossbeam_channel::unbounded();
+    let (target_tx, target_rx) = crossbeam_channel::unbounded();
+    let targets = match TargetService::spawn(target_tx) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("{e}");
+            return 1;
+        }
+    };
     info!(
         "хоткеи: диктовка {} ({:?}), пауза {}, вставить последнее {}, отмена {}",
         bindings.dictate.label(),
@@ -118,8 +127,8 @@ pub fn run() -> i32 {
         bindings.cancel.label()
     );
 
-    let parts = Parts { paths, cfg, bindings, cfg_modified, ui, net, audio, hook, paste_tx, epoch };
-    let channels = Channels { hook: hook_rx, audio: audio_rx, net: net_rx, ui: ui_rx, paste: paste_rx };
+    let parts = Parts { paths, cfg, bindings, cfg_modified, ui, net, audio, hook, paste_tx, targets, epoch };
+    let channels = Channels { hook: hook_rx, audio: audio_rx, net: net_rx, ui: ui_rx, paste: paste_rx, target: target_rx };
     let spawned = std::thread::Builder::new().name("verba-control".into()).spawn(move || {
         Controller::new(parts).run(channels);
     });

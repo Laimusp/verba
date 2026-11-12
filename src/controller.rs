@@ -8,6 +8,10 @@
 //! следующей диктовки.
 //! Запись хранится (в памяти и в `pending.wav`) до успешного распознавания; ошибка — в трей
 //! словами «что не так → что сделать»; «вставить последнее» отправляет её снова.
+//!
+//! Вставка в запомненное поле (`paste.remember_field`): при нажатии — снимок поля (`target`),
+//! после распознавания текст уходит в это поле, даже если человек ушёл в другое окно. Пока идёт
+//! новая запись, такая вставка ждёт её конца: фокус во время диктовки не трогаем.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -28,6 +32,7 @@ use crate::net::{proxy, timing_words, words, Route, Warm};
 use crate::paste::{self, PasteReport};
 use crate::secrets;
 use crate::sound::{self, Cue};
+use crate::target::{self, Delivered, How, Snapshot, TargetService, Why};
 use crate::tray::{MenuCmd, Status, UiEvent, UiHandle};
 use crate::{error, info, warn};
 
@@ -43,6 +48,7 @@ pub struct Channels {
     pub net: Receiver<NetEvent>,
     pub ui: Receiver<UiEvent>,
     pub paste: Receiver<(u64, PasteReport)>,
+    pub target: Receiver<Delivered>,
 }
 
 #[derive(Default)]
@@ -73,6 +79,14 @@ struct Dictation {
     /// что было со входом Codex (обновление, повторная отправка)
     login_detail: String,
     paste_started: Option<Instant>,
+    /// поле, где был курсор при нажатии (вставка в запомненное поле)
+    target: Option<Arc<Snapshot>>,
+    /// как доставлено в запомненное поле — для строки лога
+    delivery: Option<String>,
+    /// от начала доставки до Ctrl+V или вставки, мс
+    delivery_ms: Option<u64>,
+    /// фокус возвращали: непрочитанный буфер значит, что текст не вставлен
+    restored_focus: bool,
 }
 
 pub struct Controller {
@@ -87,6 +101,8 @@ pub struct Controller {
     recording: Option<(u64, Instant)>,
     dictations: HashMap<u64, Dictation>,
     pasting: HashMap<u64, Dictation>,
+    /// распознано во время новой записи — вставить после неё (id, текст)
+    deferred: VecDeque<(u64, String)>,
     next_id: u64,
     history: VecDeque<String>,
     /// последняя нераспознанная запись
@@ -102,6 +118,7 @@ pub struct Controller {
     audio: Sender<AudioCmd>,
     hook: HookThread,
     paste_tx: Sender<(u64, PasteReport)>,
+    targets: TargetService,
 }
 
 fn sec(ms: u64) -> String {
@@ -122,6 +139,7 @@ pub struct Parts {
     pub audio: Sender<AudioCmd>,
     pub hook: HookThread,
     pub paste_tx: Sender<(u64, PasteReport)>,
+    pub targets: TargetService,
     pub epoch: Instant,
 }
 
@@ -141,6 +159,7 @@ impl Controller {
             recording: None,
             dictations: HashMap::new(),
             pasting: HashMap::new(),
+            deferred: VecDeque::new(),
             next_id: 1,
             history: VecDeque::new(),
             pending,
@@ -155,6 +174,7 @@ impl Controller {
             audio: p.audio,
             hook: p.hook,
             paste_tx: p.paste_tx,
+            targets: p.targets,
         };
         if c.pending.is_some() {
             info!("есть нераспознанная запись с прошлого раза — «вставить последнее» отправит её");
@@ -185,6 +205,7 @@ impl Controller {
                     Ok(e) => self.on_ui(e),
                 },
                 recv(ch.paste) -> m => if let Ok((id, r)) = m { self.on_paste(id, r) },
+                recv(ch.target) -> m => if let Ok(d) = m { self.on_target(d) },
                 default(wait) => {}
             }
             self.tick();
@@ -259,10 +280,13 @@ impl Controller {
         self.next_id += 1;
         // первым — микрофон: каждая миллисекунда до его открытия — потерянный звук
         let _ = self.audio.send(AudioCmd::Start { id });
+        // вторым — снимок поля: человек ещё здесь, фокус на месте
+        let target = self.capture_target();
         self.recording = Some((id, pressed_at));
         self.mods_released_since = None;
         let engine = self.cfg.engine;
-        self.dictations.insert(id, Dictation { id, engine, pressed_at: Some(pressed_at), paste: !self.locked, ..Default::default() });
+        self.dictations
+            .insert(id, Dictation { id, engine, pressed_at: Some(pressed_at), paste: !self.locked, target, ..Default::default() });
         MATCHER.set_cancel_armed(true);
         match engine {
             Engine::OpenRouter => {
@@ -296,6 +320,7 @@ impl Controller {
             sound::play(Cue::Stop);
         }
         self.publish();
+        self.flush_deferred();
     }
 
     fn cancel(&mut self) {
@@ -306,6 +331,7 @@ impl Controller {
         self.machine.reset();
         info!("диктовка #{id}: отменена");
         self.publish();
+        self.flush_deferred();
     }
 
     fn toggle_pause(&mut self) {
@@ -331,14 +357,24 @@ impl Controller {
             let id = self.next_id;
             self.next_id += 1;
             info!("диктовка #{id}: повтор сохранённой записи по «вставить последнее»");
+            // текст встанет туда, где курсор был при нажатии «вставить последнее»
+            let target = self.capture_target();
             self.dictations.insert(
                 id,
-                Dictation { id, engine: self.cfg.engine, paste: !self.locked, retry: true, wav: Some(wav.clone()), ..Default::default() },
+                Dictation {
+                    id,
+                    engine: self.cfg.engine,
+                    paste: !self.locked,
+                    retry: true,
+                    wav: Some(wav.clone()),
+                    target,
+                    ..Default::default()
+                },
             );
             self.transcribe(id, wav);
             self.publish();
         } else if let Some(text) = self.history.front().cloned() {
-            self.paste_text(0, text);
+            self.paste_text(0, text, None);
         } else {
             self.ui.notify("Вставлять нечего: диктовок ещё не было");
         }
@@ -363,6 +399,7 @@ impl Controller {
                 }
                 self.dictations.remove(&id);
                 self.fail(id, words);
+                self.flush_deferred();
             }
             AudioEvent::Finished { id, processed, encode_ms, device_lost } => {
                 let Some(d) = self.dictations.get_mut(&id) else { return };
@@ -556,8 +593,14 @@ impl Controller {
             let id = d.id;
             let mut d = d;
             d.paste_started = Some(Instant::now());
+            let target = d.target.clone();
             self.pasting.insert(id, d);
-            self.paste_text(id, text);
+            if self.recording.is_some() && self.remember_field(&target) {
+                info!("диктовка #{id}: распознана во время новой записи — вставлю после неё");
+                self.deferred.push_back((id, text));
+            } else {
+                self.paste_text(id, text, target);
+            }
         } else {
             if self.locked {
                 self.suppressed_while_locked = true;
@@ -568,22 +611,95 @@ impl Controller {
         self.publish();
     }
 
-    fn paste_text(&mut self, id: u64, mut text: String) {
+    /// Снимок поля в фокусе, если вставка в запомненное поле включена.
+    fn capture_target(&self) -> Option<Arc<Snapshot>> {
+        self.cfg.paste.remember_field.then(|| self.targets.capture(&self.cfg.paste.games))
+    }
+
+    fn remember_field(&self, target: &Option<Arc<Snapshot>>) -> bool {
+        target.is_some() && self.cfg.paste.remember_field
+    }
+
+    /// Вставки, отложенные на время записи.
+    fn flush_deferred(&mut self) {
+        if self.recording.is_some() {
+            return;
+        }
+        while let Some((id, text)) = self.deferred.pop_front() {
+            if self.locked {
+                self.suppressed_while_locked = true;
+                if let Some(d) = self.pasting.remove(&id) {
+                    info!("диктовка #{id}: не вставлена — экран заблокирован");
+                    self.log_timing(&d, None);
+                }
+                continue;
+            }
+            let target = self.pasting.get(&id).and_then(|d| d.target.clone());
+            self.paste_text(id, text, target);
+        }
+    }
+
+    fn paste_text(&mut self, id: u64, mut text: String, target: Option<Arc<Snapshot>>) {
         if self.cfg.paste.trailing_space && !text.ends_with(char::is_whitespace) {
             text.push(' ');
         }
         let tx = self.paste_tx.clone();
-        paste::paste(text, self.cfg.paste.method, self.cfg.paste.restore_clipboard, move |r| {
+        let done = move |r| {
             let _ = tx.send((id, r));
-        });
+        };
+        match target.filter(|_| self.cfg.paste.remember_field) {
+            Some(snapshot) => self.targets.deliver(target::Job {
+                id,
+                text,
+                snapshot,
+                method: self.cfg.paste.method,
+                restore_clipboard: self.cfg.paste.restore_clipboard,
+                games: self.cfg.paste.games.clone(),
+                done: Box::new(done),
+            }),
+            None => paste::paste(text, self.cfg.paste.method, self.cfg.paste.restore_clipboard, done),
+        }
+    }
+
+    fn on_target(&mut self, e: Delivered) {
+        let Delivered { id, how, detail, ms } = e;
+        let Some(d) = self.pasting.get_mut(&id) else {
+            // итог вставки пришёл раньше (ошибка буфера) — строка лога уже есть
+            info!("вставка #{id}: {detail}");
+            return;
+        };
+        d.delivery = Some(detail);
+        d.delivery_ms = Some(ms);
+        match how {
+            How::Same | How::PasteError => {}
+            How::Restored { .. } => d.restored_focus = true,
+            How::ReplaceSel => {
+                if let Some(d) = self.pasting.remove(&id) {
+                    self.log_timing(&d, None);
+                }
+            }
+            How::NotPasted(why) => {
+                if let Some(d) = self.pasting.remove(&id) {
+                    self.log_timing(&d, None);
+                }
+                self.fail(id, why.words(&self.bindings.paste_last.label()));
+            }
+        }
     }
 
     fn on_paste(&mut self, id: u64, r: PasteReport) {
+        let restored_focus = self.pasting.get(&id).is_some_and(|d| d.restored_focus);
         if let Some(d) = self.pasting.remove(&id) {
             self.log_timing(&d, Some(&r));
         }
+        if r.aborted {
+            return;
+        }
         if let Some(e) = r.error {
             self.fail(id, e);
+        } else if r.read_ms.is_none() && restored_focus {
+            // окно вернули вперёд и нажали Ctrl+V, а приложение буфер не прочитало — текста в поле нет
+            self.fail(id, Why::NotRead.words(&self.bindings.paste_last.label()));
         } else if r.read_ms.is_none() && self.cfg.paste.restore_clipboard {
             info!(
                 "вставка #{id}: приложение не прочитало буфер за 8 с — фокус не в текстовом поле или окно запущено                  с правами администратора (Verba без прав в него не пишет); текст — в «Последних диктовках»"
@@ -629,21 +745,34 @@ impl Controller {
         if let Some(ms) = d.net_ms {
             parts.push(format!("сеть {} ({} отпр.)", sec(ms), d.tries.max(1)));
         }
-        // от отпускания (или от повторной отправки) до Ctrl+V
+        if let Some(t) = &d.target {
+            parts.push(format!("снимок поля {} мкс", t.capture_us));
+        }
+        if let Some(how) = &d.delivery {
+            parts.push(format!("запомненное поле: {how}"));
+        }
+        // от отпускания (или от повторной отправки) до Ctrl+V; доставка в запомненное поле —
+        // её время до Ctrl+V плюс время Ctrl+V внутри вставки
         let from = d.released_at.or(d.sent_at);
         let mut total = None;
-        if let (Some(r), Some(ps)) = (paste, d.paste_started) {
+        if let Some(r) = paste {
             parts.push(format!(
                 "вставка: Ctrl+V через {} мс, прочитано {}",
                 r.chord_ms,
                 r.read_ms.map(|m| format!("через {m} мс")).unwrap_or_else(|| "не было".into())
             ));
-            if let Some(f) = from {
-                let ms = ms_between(f, ps) + r.chord_ms;
-                total = Some(ms);
-                let from = if d.retry { "от повторной отправки" } else { "от отпускания" };
-                parts.push(format!("{from} до вставки {}", sec(ms)));
-            }
+        }
+        let insert_ms = match (paste, d.delivery_ms) {
+            (Some(r), Some(dm)) => Some(dm + r.chord_ms),
+            (Some(r), None) => Some(r.chord_ms),
+            (None, Some(dm)) if d.delivery.is_some() => Some(dm),
+            _ => None,
+        };
+        if let (Some(f), Some(ps), Some(ins)) = (from, d.paste_started, insert_ms) {
+            let ms = ms_between(f, ps) + ins;
+            total = Some(ms);
+            let from = if d.retry { "от повторной отправки" } else { "от отпускания" };
+            parts.push(format!("{from} до вставки {}", sec(ms)));
         }
         info!("диктовка #{}: {}", d.id, parts.join("; "));
         let slow = total.is_some_and(|t| t > SLOW.as_millis() as u64);

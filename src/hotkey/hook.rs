@@ -50,6 +50,9 @@ pub struct HookEvent {
 
 /// Метка своего ввода (Ctrl+V вставки, маска меню): хук пропускает его, не сверяя с сочетаниями.
 pub const INJECTED_MARK: usize = 0x5645_5242; // «VERB»
+/// Метка своего ввода, который хук глотает: система событие видит (наш процесс «дал последний
+/// ввод» → ему можно `SetForegroundWindow`), приложения — нет (`target::win`, приём AutoHotkey).
+pub const SWALLOWED_MARK: usize = 0x5645_5243; // «VERC»
 
 /// Состояние сопоставления сочетаний — только атомики: его читает обработчик хука.
 pub struct Matcher {
@@ -199,6 +202,17 @@ pub fn current_mods(trigger: u16) -> u8 {
     m
 }
 
+/// Когда последний раз шла клавиша (хук или Raw Input), по `GetTickCount`; 0 — хук не запущен.
+/// Только клавиатура: движение мыши фокусу не мешает, а нажатия ушли бы не в то окно.
+pub fn last_key_tick() -> u32 {
+    let (hook, raw) = (LAST_HOOK_TICK.load(Relaxed), LAST_RAW_TICK.load(Relaxed));
+    if (raw.wrapping_sub(hook) as i32) > 0 {
+        raw
+    } else {
+        hook
+    }
+}
+
 /// Хотя бы один модификатор основного сочетания уже отпущен (сторож удержания).
 /// Сочетание без модификаторов так не проверить — его клавишу хук глотает, система её не видит.
 pub fn dictate_mods_released() -> bool {
@@ -229,6 +243,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     if code == HC_ACTION as i32 {
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         LAST_HOOK_TICK.store(GetTickCount(), Relaxed);
+        if kb.dwExtraInfo == SWALLOWED_MARK {
+            return LRESULT(1);
+        }
         if kb.dwExtraInfo != INJECTED_MARK {
             let msg = wparam.0 as u32;
             let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
