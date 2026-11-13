@@ -320,6 +320,7 @@ impl Controller {
             Cmd::Flag(f, on) => self.set(|c| match f {
                 Flag::RememberField => c.paste.remember_field = on,
                 Flag::TrailingSpace => c.paste.trailing_space = on,
+                Flag::Humanize => c.paste.humanize = on,
                 Flag::RestoreClipboard => c.paste.restore_clipboard = on,
                 Flag::KeepOpen => c.microphone.keep_open = on,
                 Flag::SoundRecording => c.sounds.recording = on,
@@ -821,6 +822,7 @@ impl Controller {
             hold_ms: self.cfg.hotkeys.hybrid_hold_ms,
             remember_field: self.cfg.paste.remember_field,
             trailing_space: self.cfg.paste.trailing_space,
+            humanize: self.cfg.paste.humanize,
             restore_clipboard: self.cfg.paste.restore_clipboard,
             games: self.cfg.paste.games.clone(),
             devices,

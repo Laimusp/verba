@@ -80,6 +80,7 @@ export struct View {
     hold-ms: int,
     remember-field: bool,
     trailing-space: bool,
+    humanize: bool,
     restore-clipboard: bool,
     games: [string],
     devices: [string],
@@ -946,6 +947,17 @@ export component SettingsWindow inherits Window {
                                     Toggle {
                                         on: root.view.trailing-space;
                                         toggled(v) => { root.act("flag", v ? "trailing_space=1" : "trailing_space=0"); }
+                                    }
+                                }
+                            }
+                            Row {
+                                title: "Очеловечить текст";
+                                hint: "Тире —, «ёлочки» и … → как с клавиатуры: - \" ...";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.view.humanize;
+                                        toggled(v) => { root.act("flag", v ? "humanize=1" : "humanize=0"); }
                                     }
                                 }
                             }

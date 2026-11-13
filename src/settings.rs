@@ -96,6 +96,7 @@ pub struct ViewData {
     pub hold_ms: u64,
     pub remember_field: bool,
     pub trailing_space: bool,
+    pub humanize: bool,
     pub restore_clipboard: bool,
     pub games: Vec<String>,
     /// первый пункт — «как в Windows»
@@ -126,6 +127,7 @@ pub enum Msg {
 pub enum Flag {
     RememberField,
     TrailingSpace,
+    Humanize,
     RestoreClipboard,
     KeepOpen,
     SoundRecording,
@@ -202,6 +204,7 @@ pub fn parse_act(name: &str, arg: &str) -> Option<Cmd> {
             let flag = match k {
                 "remember_field" => Flag::RememberField,
                 "trailing_space" => Flag::TrailingSpace,
+                "humanize" => Flag::Humanize,
                 "restore_clipboard" => Flag::RestoreClipboard,
                 "keep_open" => Flag::KeepOpen,
                 "snd_rec" => Flag::SoundRecording,
@@ -504,6 +507,7 @@ fn fill(w: &ui::SettingsWindow, v: &ViewData) {
         hold_ms: v.hold_ms.min(i32::MAX as u64) as i32,
         remember_field: v.remember_field,
         trailing_space: v.trailing_space,
+        humanize: v.humanize,
         restore_clipboard: v.restore_clipboard,
         games: strings(&v.games),
         devices: strings(&v.devices),
@@ -536,6 +540,8 @@ mod tests {
         assert_eq!(parse_act("hold-ms", "50"), Some(Cmd::HoldMs(100)), "порог не ниже 100 мс");
         assert_eq!(parse_act("hold-ms", "5000"), Some(Cmd::HoldMs(2000)));
         assert_eq!(parse_act("flag", "keep_open=1"), Some(Cmd::Flag(Flag::KeepOpen, true)));
+        assert_eq!(parse_act("flag", "humanize=1"), Some(Cmd::Flag(Flag::Humanize, true)));
+        assert_eq!(parse_act("flag", "humanize=0"), Some(Cmd::Flag(Flag::Humanize, false)));
         assert_eq!(parse_act("flag", "nope=1"), None);
         assert_eq!(parse_act("overlay", "2"), Some(Cmd::Overlay(Position::Off)));
         assert_eq!(parse_act("url", "file:///c:/x"), None, "наружу — только https");

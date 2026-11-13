@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 pub mod controller;
 pub mod hotkey;
+pub mod humanize;
 pub mod icons;
 pub mod net;
 pub mod overlay;

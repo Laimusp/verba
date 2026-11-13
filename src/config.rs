@@ -184,6 +184,9 @@ pub struct Paste {
     /// вставлять в поле, где был курсор при нажатии хоткея, даже если фокус потом ушёл в другое
     /// окно (`docs/focus-restore.md`); выключено — вставка туда, где фокус сейчас
     pub remember_field: bool,
+    /// очеловечить текст перед вставкой: длинное тире, «ёлочки», многоточие одним знаком,
+    /// неразрывные и невидимые пробелы → то, что человек набирает с клавиатуры (`humanize.rs`)
+    pub humanize: bool,
     /// exe игр (`game.exe`, как в Диспетчере задач): фокус в них не возвращается — Ctrl+V в игру
     /// с закрытым чатом стал бы нажатиями игровых клавиш. Полноэкранное окно — игра и без списка
     pub games: Vec<String>,
@@ -196,6 +199,7 @@ impl Default for Paste {
             trailing_space: true,
             restore_clipboard: true,
             remember_field: true,
+            humanize: false,
             games: Vec::new(),
         }
     }
@@ -475,6 +479,15 @@ mod tests {
         let mut off: Config = serde_json::from_str(r#"{"paste": {"remember_field": false}}"#).unwrap();
         off.validate().unwrap();
         assert!(!off.paste.remember_field);
+    }
+
+    #[test]
+    fn humanize_is_off_by_default_and_reads() {
+        assert!(!Config::default().paste.humanize);
+        let old: Config = serde_json::from_str(r#"{"paste": {"trailing_space": false}}"#).unwrap();
+        assert!(!old.paste.humanize, "старый файл без поля — выключено");
+        let on: Config = serde_json::from_str(r#"{"paste": {"humanize": true}}"#).unwrap();
+        assert!(on.paste.humanize);
     }
 
     #[test]

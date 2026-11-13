@@ -21,6 +21,7 @@ mod prefs;
 
 pub use prefs::{show_flag, Worker};
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -34,6 +35,7 @@ use crate::config::{self, Bindings, Config, Engine, Paths, ProxyKind};
 use crate::hotkey::binding::{Binding, MOD_ALT, MOD_WIN};
 use crate::hotkey::hook::{self, HookEvent, HookThread, HotkeyId, MATCHER};
 use crate::hotkey::mode::{Action, ModeMachine};
+use crate::humanize::humanize;
 use crate::net::codex::{self, CodexSetup};
 use crate::net::service::{Job, NetCmd, NetEvent, NetService};
 use crate::net::words::Service;
@@ -100,6 +102,8 @@ struct Dictation {
     delivery_ms: Option<u64>,
     /// фокус возвращали: непрочитанный буфер значит, что текст не вставлен
     restored_focus: bool,
+    /// сколько знаков заменило очеловечивание (`paste.humanize`)
+    humanized: usize,
 }
 
 pub struct Controller {
@@ -711,7 +715,23 @@ impl Controller {
         }
     }
 
-    fn paste_text(&mut self, id: u64, mut text: String, target: Option<Arc<Snapshot>>) {
+    /// Текст, каким он уходит из Verba (вставка, копия из истории трея): с очеловечиванием, если
+    /// оно включено. История хранит исходник — переключатель действует и на уже распознанное.
+    fn outgoing(&self, text: String) -> (String, usize) {
+        if !self.cfg.paste.humanize {
+            return (text, 0);
+        }
+        match humanize(&text) {
+            (Cow::Borrowed(_), _) => (text, 0),
+            (Cow::Owned(t), n) => (t, n),
+        }
+    }
+
+    fn paste_text(&mut self, id: u64, text: String, target: Option<Arc<Snapshot>>) {
+        let (mut text, humanized) = self.outgoing(text);
+        if let Some(d) = self.pasting.get_mut(&id) {
+            d.humanized = humanized;
+        }
         if self.cfg.paste.trailing_space && !text.ends_with(char::is_whitespace) {
             text.push(' ');
         }
@@ -833,6 +853,9 @@ impl Controller {
         if let Some(how) = &d.delivery {
             parts.push(format!("запомненное поле: {how}"));
         }
+        if d.humanized > 0 {
+            parts.push(format!("очеловечено знаков: {}", d.humanized));
+        }
         // от отпускания (или от повторной отправки) до Ctrl+V; доставка в запомненное поле —
         // её время до Ctrl+V плюс время Ctrl+V внутри вставки
         let from = d.released_at.or(d.sent_at);
@@ -897,8 +920,8 @@ impl Controller {
                 }
                 MenuCmd::SelectEngine(engine) => self.select_engine(engine),
                 MenuCmd::CopyHistory(i) => {
-                    if let Some(t) = self.history.get(i) {
-                        if !paste::copy_text(t) {
+                    if let Some(t) = self.history.get(i).cloned() {
+                        if !paste::copy_text(&self.outgoing(t).0) {
                             self.ui.notify("Буфер обмена занят другой программой → попробуй ещё раз");
                         }
                     }
