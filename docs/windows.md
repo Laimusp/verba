@@ -8,6 +8,7 @@
 - Окно с правами администратора: Verba без прав в него не вставит, и Windows об этом не сообщает.
 - Вставка в окно, которое уже не впереди: обходы и замеры — `docs/focus-restore.md`.
 - Оверлей записи не берёт фокус и пропускает мышь; кадр — DIB с предумноженной альфой. Текст GDI рисуется в отдельную маску: GDI обнуляет альфу пикселей, которых коснулся.
+- Slint без `font-family` рисует на Windows шрифтом Arial, а не системным Segoe UI — шрифт окна задаётся явно. Запасных имён Slint не принимает: моноширинный шрифт (Cascadia Mono, на Windows 10 — Consolas) выбирает Rust по таблице шрифтов GDI.
 - Автозапуск с правами — задача планировщика «Verba (admin)»: создаётся через одно окно UAC, читается и запускается без прав. Приоритет задачи — 4, иначе Windows запустит Verba ниже обычного.
 - Каждый пункт ниже: что, источник, проверено ли на живой системе (12.11.2026, Windows 11 Pro 26100).
 
@@ -95,9 +96,15 @@
 ## Оверлей: альфа кадра и текст GDI
 - **Что:** `UpdateLayeredWindow` с `AC_SRC_ALPHA` берёт 32-битный DIB с предумноженной альфой: каждый цветовой канал уже умножен на альфу (канал больше альфы — пересвет). GDI альфу не пишет: замер — `TextOutW` в 32-битный DIB с альфой 255 обнулил альфу у всех 174 пикселей, которых коснулся, — текст на плашке был бы дырой. Поэтому GDI рисует текст белым по чёрному в отдельный DIB (`ANTIALIASED_QUALITY` — сглаживание оттенками серого, без цветной каймы ClearType), яркость пикселя — покрытие, и кадр смешивает цвет текста по нему.
 - Появление и уход — прозрачностью окна целиком (`SourceConstantAlpha`), тем же кадром: вызов без `hdcSrc` документация разрешает только с `dwFlags = 0` («If hdcSrc is NULL, dwFlags should be zero»), поэтому кадр подаётся каждый раз (~10 вызовов на уход).
-- Шрифт: GDI отдаёт «Segoe UI Variable Text» как семейство (проверено `GetTextFaceW`); нет его — «Segoe UI». Время рисуется по символу в клетки ширины самой широкой цифры — не дрожит.
+- Шрифт — «Bahnschrift», как у окна настроек (T-006); нет — «Segoe UI». GDI отдаёт его как семейство (проверено `GetTextFaceW`). Время рисуется по символу в клетки ширины самой широкой цифры — не дрожит.
 - **Источник:** [BLENDFUNCTION](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-blendfunction) (AC_SRC_ALPHA: «the APIs use premultiplied alpha»), [UpdateLayeredWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-updatelayeredwindow), [LOGFONTW](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-logfontw) (`ANTIALIASED_QUALITY`); снимки экрана с layered-окнами — `BitBlt` с `CAPTUREBLT` ([BitBlt](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-bitblt)).
 - **Проверено:** снимки плашки в тёмной и светлой теме (`examples/overlay_demo.rs --shots`) — текст ровный, без дыр и каймы; волна за 210 мс меняется, при «Распознаю…» за 300 мс — ни пикселя.
+
+## Шрифты окна Slint и плашки
+- **Что:** Slint 1.18 с программной отрисовкой берёт системные шрифты через fontique (DirectWrite). Без `font-family` и `default-font-family` шрифт по умолчанию на Windows — Arial: ширина строки у пустого имени, несуществующего «NoSuchFont», «sans-serif», «system-ui» и «Arial» одна и та же (689 px), у «Segoe UI» — другая (675 px). До T-006 окно настроек так и рисовалось Arial. Находит «Segoe UI Variable Text», «Bahnschrift», «Cascadia Mono»; имена начертаний вроде «Bahnschrift SemiBold» или «Segoe UI Semibold» — нет (Arial): начертание задаётся `font-weight`.
+- `font-family` — одно имя, без списка запасных (`i-slint-core-1.18.1/textlayout/sharedparley/shaping.rs:90`: имя, затем общие семейства). Шрифта нет — снова Arial. Cascadia Mono есть в Windows 11, в Windows 10 — нет; поэтому окно берёт имя моноширинного шрифта из Rust (`settings.rs` `mono_family`): есть ли «Cascadia Mono», проверяет GDI (`overlay::has_font` — `CreateFontIndirectW` и сверка имени из `GetTextFaceW`, GDI молча подставляет другой шрифт), иначе «Consolas».
+- **Источник:** пробник ширины строк Slint (13.11.2026, своя платформа с `MinimalSoftwareWindow`, как `examples/ui_shots.rs`); [GetTextFaceW](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-gettextfacew).
+- **Проверено:** снимки окна (`cargo run --example ui_shots -- <папка>`) — Bahnschrift и Cascadia Mono на месте; плашка (`overlay_demo`) — в логе «оверлей: шрифт Bahnschrift, 13 px». Windows 10 без Cascadia Mono живьём не проверялся — только тест `has_font` на несуществующем имени. [не проверено вживую]
 
 ## Активация окна из тестового сценария
 - **Что:** `SetForegroundWindow` из фонового процесса запрещён (foreground lock); работает после `AttachThreadInput` к потоку переднего окна.

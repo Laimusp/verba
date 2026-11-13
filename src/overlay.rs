@@ -255,8 +255,9 @@ impl Metrics {
         let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
         let px = |v: f32| ((v * scale).round() as i32).max(1);
         Metrics {
-            h: px(44.0),
-            w_wave: px(240.0),
+            // T-006: 240×44 → 180×40 — «слишком широкое»; волна 13 столбиков при времени, 7 при «Распознаю…»
+            h: px(40.0),
+            w_wave: px(180.0),
             w_max: px(520.0),
             w_text: px(120.0),
             pad_l: px(16.0),
@@ -267,7 +268,7 @@ impl Metrics {
             // 3,5 и 2,5: на 100 % — 4 и 3 px, как у Handy; на 150 % — 5 и 4
             bar: px(3.5),
             bar_gap: px(2.5),
-            bar_max: px(22.0),
+            bar_max: px(20.0),
             font: px(13.0),
             margin_bottom: px(48.0),
             margin_top: px(32.0),
@@ -456,17 +457,62 @@ struct Theme {
     muted: Rgb,
 }
 
-/// Тёплый графит, как поверхности QED (`qed\ui\src\styles\tokens.css`: bg-1, fg-0, fg-1); чуть прозрачная.
-const DARK: Theme = Theme { plate: (0x1F, 0x1E, 0x1C), plate_a: 0.92, ink: (0xEB, 0xE9, 0xE6), muted: (0xAB, 0xA6, 0x9F) };
+/// Стиль «Табло» (T-006): почти чёрная, как фон окна настроек, чуть прозрачная.
+const DARK: Theme = Theme { plate: (0x11, 0x11, 0x11), plate_a: 0.94, ink: (0xF2, 0xF2, 0xF2), muted: (0x98, 0x98, 0x98) };
 /// Светлая — серее белого: без рамки и тени плашка иначе теряется на белой странице.
-const LIGHT: Theme = Theme { plate: (0xEE, 0xED, 0xEA), plate_a: 0.96, ink: (0x1F, 0x1E, 0x1C), muted: (0x5E, 0x5A, 0x55) };
+const LIGHT: Theme = Theme { plate: (0xEA, 0xEA, 0xEA), plate_a: 0.96, ink: (0x0E, 0x0E, 0x0E), muted: (0x5C, 0x5C, 0x5C) };
 
-/// Тема по режиму Windows (панель задач, «Пуск», всплывающие окна системы): плашка — системная подсказка
-/// над панелью задач. `VERBA_OVERLAY_THEME=dark|light` — проверка обеих тем (`examples/overlay_demo.rs`).
+/// Шрифт плашки — как у окна настроек (Bahnschrift, Windows 10 1709+); нет — Segoe UI.
+const FACES: [&str; 2] = ["Bahnschrift", "Segoe UI"];
+
 fn system_theme() -> Theme {
+    if system_light() {
+        LIGHT
+    } else {
+        DARK
+    }
+}
+
+/// Есть ли шрифт в Windows: GDI молча подставляет другой, поэтому сверяется имя выбранного. Таблица шрифтов GDI —
+/// в памяти, диск не читается.
+pub fn has_font(face: &str) -> bool {
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() {
+            return false;
+        }
+        let mut lf = LOGFONTW {
+            lfHeight: -12,
+            lfCharSet: DEFAULT_CHARSET,
+            lfOutPrecision: OUT_TT_PRECIS,
+            lfClipPrecision: CLIP_DEFAULT_PRECIS,
+            ..Default::default()
+        };
+        for (d, s) in lf.lfFaceName.iter_mut().zip(face.encode_utf16().take(31)) {
+            *d = s;
+        }
+        let font = CreateFontIndirectW(&lf);
+        let mut found = false;
+        if !font.is_invalid() {
+            let old = SelectObject(dc, HGDIOBJ(font.0));
+            let mut name = [0u16; 64];
+            let n = GetTextFaceW(dc, Some(&mut name)).max(0) as usize;
+            let got = String::from_utf16_lossy(&name[..n.min(name.len())]);
+            found = got.trim_end_matches('\0').eq_ignore_ascii_case(face);
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+        let _ = DeleteDC(dc);
+        found
+    }
+}
+
+/// Светлая ли тема Windows (панель задач, «Пуск», всплывающие окна системы): плашка — системная подсказка
+/// над панелью задач. `VERBA_OVERLAY_THEME=dark|light` — проверка обеих тем (`examples/overlay_demo.rs`).
+fn system_light() -> bool {
     match std::env::var("VERBA_OVERLAY_THEME").as_deref() {
-        Ok("dark") => return DARK,
-        Ok("light") => return LIGHT,
+        Ok("dark") => return false,
+        Ok("light") => return true,
         _ => {}
     }
     let mut value: u32 = 0;
@@ -483,11 +529,7 @@ fn system_theme() -> Theme {
         )
     };
     // нет значения (старая Windows) — тёмная
-    if r.is_ok() && value == 1 {
-        LIGHT
-    } else {
-        DARK
-    }
+    r.is_ok() && value == 1
 }
 
 /// Капсула: прямоугольник, скруглённый по короткой стороне, в пикселях кадра.
@@ -652,7 +694,7 @@ struct TextDc {
 static FONT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 impl TextDc {
-    /// Segoe UI Variable Text (Windows 11), нет — Segoe UI; сглаживание в оттенках серого, без ClearType:
+    /// Первый из `FACES`, который есть (последний — без проверки); сглаживание в оттенках серого, без ClearType:
     /// цветная подпиксельная кайма на прозрачной плашке видна.
     fn new(px: i32) -> Option<TextDc> {
         unsafe {
@@ -660,9 +702,8 @@ impl TextDc {
             if dc.is_invalid() {
                 return None;
             }
-            let faces = ["Segoe UI Variable Text", "Segoe UI"];
             let mut chosen = None;
-            for (i, face) in faces.iter().enumerate() {
+            for (i, face) in FACES.iter().enumerate() {
                 let mut lf = LOGFONTW {
                     lfHeight: -px,
                     lfWeight: FW_NORMAL.0 as i32,
@@ -684,7 +725,7 @@ impl TextDc {
                 let mut name = [0u16; 64];
                 let n = GetTextFaceW(dc, Some(&mut name)).max(0) as usize;
                 let got = String::from_utf16_lossy(&name[..n.min(name.len())]).trim_end_matches('\0').to_string();
-                if got.eq_ignore_ascii_case(face) || i + 1 == faces.len() {
+                if got.eq_ignore_ascii_case(face) || i + 1 == FACES.len() {
                     if !FONT_LOGGED.swap(true, Ordering::Relaxed) {
                         crate::info!("оверлей: шрифт {got}, {px} px");
                     }
@@ -1369,12 +1410,12 @@ mod tests {
     #[test]
     fn metrics_follow_dpi() {
         let m = Metrics::new(96);
-        assert_eq!((m.h, m.w_wave, m.bar, m.bar_gap, m.bar_max, m.font), (44, 240, 4, 3, 22, 13));
+        assert_eq!((m.h, m.w_wave, m.bar, m.bar_gap, m.bar_max, m.font), (40, 180, 4, 3, 20, 13));
         assert_eq!(m.dot, 8);
         let m = Metrics::new(144);
-        assert_eq!((m.h, m.w_wave, m.bar, m.bar_gap), (66, 360, 5, 4));
+        assert_eq!((m.h, m.w_wave, m.bar, m.bar_gap), (60, 270, 5, 4));
         let m = Metrics::new(192);
-        assert_eq!((m.h, m.w_wave, m.bar, m.bar_gap, m.w_max), (88, 480, 7, 5, 1040));
+        assert_eq!((m.h, m.w_wave, m.bar, m.bar_gap, m.w_max), (80, 360, 7, 5, 1040));
         assert_eq!(Metrics::new(0), Metrics::new(96));
         // плашка с текстом не шире рабочей области
         let m = Metrics::new(96);
@@ -1393,8 +1434,8 @@ mod tests {
         let m = Metrics::new(144);
         let work = RECT { left: -2560, top: -200, right: 0, bottom: 1240 - 72 };
         let (x, y) = place(work, m.w_wave, m.h, Position::Bottom, &m);
-        assert_eq!(x, -2560 + (2560 - 360) / 2);
-        assert_eq!(y, 1168 - 66 - 72);
+        assert_eq!(x, -2560 + (2560 - 270) / 2);
+        assert_eq!(y, 1168 - 60 - 72);
         // нечётный остаток — без сдвига на полпикселя наружу
         let work = RECT { left: -1001, top: 0, right: 0, bottom: 500 };
         assert_eq!(place(work, 240, 44, Position::Bottom, &Metrics::new(96)).0, -1001 + 380);
@@ -1586,6 +1627,24 @@ mod tests {
     }
 
     #[test]
+    fn plate_text_reads_in_both_themes() {
+        let lum = |c: Rgb| 0.2126 * f32::from(c.0) + 0.7152 * f32::from(c.1) + 0.0722 * f32::from(c.2);
+        for t in [DARK, LIGHT] {
+            // текст и время читаются на плашке: разница яркости заметная
+            assert!((lum(t.ink) - lum(t.plate)).abs() > 150.0, "{t:?}");
+            assert!((lum(t.muted) - lum(t.plate)).abs() > 70.0, "{t:?}");
+            assert!(t.plate_a > 0.9 && t.plate_a <= 1.0);
+        }
+    }
+
+    #[test]
+    fn font_check_tells_real_fonts_from_substitutes() {
+        assert!(has_font("Segoe UI"), "Segoe UI есть в любой Windows 10/11");
+        assert!(!has_font("Нет Такого Шрифта"), "GDI подставил бы другой — проверка это видит");
+        assert!(!has_font(""));
+    }
+
+    #[test]
     fn gdi_text_mask_has_coverage_and_digits_of_one_width() {
         let Some(t) = TextDc::new(13) else { panic!("шрифт не создался") };
         let m = t.mask("0:07", true).expect("маска");
@@ -1599,7 +1658,7 @@ mod tests {
         }
         assert_eq!(t.measure("1:11", true), t.measure("0:08", true), "время не дрожит");
         // строка встаёт по центру плашки: прописные и цифры около середины высоты
-        let top = m.top_in(44);
-        assert!(top > 5 && top + m.ascent > 22 && top + m.ascent < 32, "{top}");
+        let top = m.top_in(40);
+        assert!(top > 3 && top + m.ascent > 20 && top + m.ascent < 30, "{top}");
     }
 }

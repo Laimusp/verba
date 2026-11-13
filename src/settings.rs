@@ -296,6 +296,14 @@ fn logo() -> slint::Image {
     slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, size, size))
 }
 
+/// Моноширинный шрифт окна (сочетания клавиш, ключ, прокси, имена моделей): Cascadia Mono есть в Windows 11, нет —
+/// Consolas (Windows 10). Slint запасных имён не принимает, поэтому выбор здесь; проверка — таблица шрифтов GDI в
+/// памяти, без диска, раз на процесс.
+fn mono_family() -> &'static str {
+    static MONO: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    MONO.get_or_init(|| if crate::overlay::has_font("Cascadia Mono") { "Cascadia Mono" } else { "Consolas" })
+}
+
 fn open() {
     let existing = STATE.with(|s| s.borrow().win.as_ref().map(|w| w.as_weak()));
     if let Some(w) = existing.and_then(|w| w.upgrade()) {
@@ -312,6 +320,7 @@ fn open() {
         }
     };
     win.set_logo(logo());
+    win.global::<ui::Theme>().set_font_mono(mono_family().into());
     win.on_act(|name, arg| match parse_act(&name, &arg) {
         Some(cmd) => send(cmd),
         None => crate::warn!("окно настроек: незнакомое действие «{name}»"),

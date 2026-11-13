@@ -2,29 +2,43 @@
 // коралл, белый, чёрный; тонких линий нет совсем (группы — заливкой, состояние — цветом заливки);
 // окно небольшое, но кнопки и текст не мелкие; меньше текста, больше смысла.
 // Всё, что показывает окно, приходит из Rust одной структурой View; действия уходят callback-ом act.
+// Стиль «Табло» (T-006, выбор владельца 13.11.2026 из четырёх): Bahnschrift — шрифт как у табло DIN, почти чёрный
+// фон, острые углы; технические строки (сочетания клавиш, ключ, прокси, имена моделей и exe) — моноширинным.
 
 import { Palette } from "std-widgets.slint";
 
 export global Theme {
-    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
-    out property <color> bg: dark ? #1b1917 : #ffffff;
-    out property <color> nav: dark ? #151311 : #f6f3f0;
-    out property <color> card: dark ? #252220 : #f6f3f0;
-    out property <color> control: dark ? #34302d : #ebe5e0;
-    out property <color> control-hover: dark ? #3e3a36 : #e2dbd5;
-    out property <color> control-strong: dark ? #4b4541 : #d3cbc4;
-    out property <color> popup: dark ? #34302d : #ffffff;
-    out property <color> fg: dark ? #f5f1ed : #1b1917;
-    out property <color> fg2: dark ? #a39a93 : #6f6660;
+    // 0 — тема по системе; 1 — тёмная, 2 — светлая (снимки examples/ui_shots.rs)
+    in property <int> scheme: 0;
+    out property <bool> dark: scheme == 0 ? Palette.color-scheme == ColorScheme.dark : scheme == 1;
+    out property <color> bg: dark ? #0e0e0e : #fafafa;
+    out property <color> nav: dark ? #070707 : #efefef;
+    out property <color> card: dark ? #171717 : #efefef;
+    out property <color> control: dark ? #222222 : #e2e2e2;
+    out property <color> control-hover: dark ? #2b2b2b : #d8d8d8;
+    out property <color> control-strong: dark ? #383838 : #c6c6c6;
+    out property <color> popup: dark ? #222222 : #ffffff;
+    out property <color> fg: dark ? #f4f4f4 : #0e0e0e;
+    out property <color> fg2: dark ? #8c8c8c : #666666;
     out property <color> accent: #e5484d;
     out property <color> accent-hover: #ec5b60;
     out property <color> accent-pressed: #cf3c41;
     out property <color> on-accent: #ffffff;
     out property <color> ok: dark ? #63c784 : #2b8a48;
     out property <color> err: dark ? #ff8286 : #cc2f35;
-    out property <length> fs: 14px;
+    // Slint без имени шрифта берёт на Windows Arial (docs/windows.md «Шрифты окна Slint и плашки») — имя задано явно
+    out property <string> font: "Bahnschrift";
+    // Slint принимает одно имя без запасных: Rust ставит «Consolas», если Cascadia Mono нет (Windows 10)
+    in property <string> font-mono: "Cascadia Mono";
+    out property <length> fs: 15px;
     out property <length> fs-small: 13px;
-    out property <length> fs-title: 15px;
+    out property <length> fs-title: 16px;
+    out property <length> fs-page: 26px;
+    out property <length> fs-mono: 13px;
+    // скругления: кнопки и поля, карточки, переключатели
+    out property <length> radius: 4px;
+    out property <length> radius-card: 6px;
+    out property <length> radius-pill: 4px;
 }
 
 export struct Line {
@@ -91,7 +105,7 @@ component Btn inherits Rectangle {
     height: 36px;
     min-width: max(84px, label.preferred-width + 32px);
     horizontal-stretch: 0;
-    border-radius: 8px;
+    border-radius: Theme.radius;
     opacity: enabled ? 1 : 0.45;
     background: (primary || danger) && enabled
         ? (ta.pressed ? Theme.accent-pressed : ta.has-hover ? Theme.accent-hover : Theme.accent)
@@ -117,12 +131,15 @@ component Btn inherits Rectangle {
 component Field inherits Rectangle {
     in property <string> placeholder;
     in property <bool> password;
+    // адреса, имена моделей и exe — моноширинным; подсказка словами («или по имени») — обычным
+    in property <bool> mono;
+    in property <bool> mono-placeholder: mono;
     in-out property <string> text <=> input.text;
     callback accepted;
     height: 36px;
     min-width: 120px;
     horizontal-stretch: 1;
-    border-radius: 8px;
+    border-radius: Theme.radius;
     background: input.has-focus ? Theme.control-hover : Theme.control;
     animate background { duration: 90ms; }
     input := TextInput {
@@ -132,7 +149,8 @@ component Field inherits Rectangle {
         vertical-alignment: center;
         single-line: true;
         color: Theme.fg;
-        font-size: Theme.fs;
+        font-family: root.mono ? Theme.font-mono : Theme.font;
+        font-size: root.mono ? Theme.fs-mono + 1px : Theme.fs;
         input-type: root.password ? InputType.password : InputType.text;
         selection-background-color: Theme.accent;
         selection-foreground-color: Theme.on-accent;
@@ -145,7 +163,8 @@ component Field inherits Rectangle {
         vertical-alignment: center;
         text: root.placeholder;
         color: Theme.fg2;
-        font-size: Theme.fs;
+        font-family: root.mono-placeholder ? Theme.font-mono : Theme.font;
+        font-size: root.mono-placeholder ? Theme.fs-mono + 1px : Theme.fs;
         overflow: elide;
     }
 }
@@ -156,7 +175,7 @@ component Toggle inherits Rectangle {
     callback toggled(bool);
     width: 44px;
     height: 24px;
-    border-radius: 12px;
+    border-radius: Theme.radius-pill;
     opacity: enabled ? 1 : 0.45;
     background: on ? (ta.has-hover ? Theme.accent-hover : Theme.accent) : (ta.has-hover ? Theme.control-strong : Theme.control-strong);
     animate background { duration: 120ms; }
@@ -165,7 +184,7 @@ component Toggle inherits Rectangle {
         x: root.on ? root.width - self.width - 3px : 3px;
         width: 18px;
         height: 18px;
-        border-radius: 9px;
+        border-radius: min(9px, Theme.radius-pill);
         background: root.on ? Theme.on-accent : Theme.fg2;
         animate x { duration: 120ms; easing: ease-out; }
     }
@@ -181,13 +200,13 @@ component Segmented inherits Rectangle {
     in property <int> selected;
     callback select(int);
     height: 36px;
-    border-radius: 10px;
+    border-radius: Theme.radius + 2px;
     background: Theme.control;
     HorizontalLayout {
         padding: 3px;
         spacing: 3px;
         for o[i] in root.options: Rectangle {
-            border-radius: 8px;
+            border-radius: Theme.radius;
             min-width: t.preferred-width + 28px;
             background: i == root.selected ? Theme.accent : sa.has-hover ? Theme.control-hover : transparent;
             animate background { duration: 120ms; }
@@ -218,7 +237,7 @@ component Select inherits Rectangle {
     height: 36px;
     min-width: 160px;
     horizontal-stretch: 1;
-    border-radius: 8px;
+    border-radius: Theme.radius;
     opacity: enabled ? 1 : 0.6;
     background: ta.has-hover && enabled ? Theme.control-hover : Theme.control;
     Text {
@@ -255,14 +274,14 @@ component Select inherits Rectangle {
         height: min(root.options.length * 36px + 8px, 296px);
         Rectangle {
             background: Theme.popup;
-            border-radius: 10px;
+            border-radius: Theme.radius + 2px;
             Flickable {
                 content-height: list.preferred-height;
                 list := VerticalLayout {
                     padding: 4px;
                     for o[i] in root.options: Rectangle {
                         height: 36px;
-                        border-radius: 8px;
+                        border-radius: Theme.radius;
                         background: i == root.selected ? Theme.control : oa.has-hover ? Theme.control-hover : transparent;
                         Text {
                             x: 10px;
@@ -271,6 +290,7 @@ component Select inherits Rectangle {
                             vertical-alignment: center;
                             text: o;
                             color: Theme.fg;
+                            font-family: Theme.font;
                             font-size: Theme.fs;
                             overflow: elide;
                         }
@@ -287,7 +307,7 @@ component Select inherits Rectangle {
 
 component Card inherits Rectangle {
     background: Theme.card;
-    border-radius: 12px;
+    border-radius: Theme.radius-card;
     VerticalLayout {
         padding: 16px;
         spacing: 12px;
@@ -306,6 +326,8 @@ component Row inherits HorizontalLayout {
     in property <string> title;
     in property <string> hint;
     in property <bool> hint-err;
+    // подсказка — техническая строка (маска ключа, адрес прокси)
+    in property <bool> hint-mono;
     spacing: 8px;
     VerticalLayout {
         alignment: center;
@@ -316,7 +338,8 @@ component Row inherits HorizontalLayout {
         if root.hint != "": Text {
             text: root.hint;
             color: root.hint-err ? Theme.err : Theme.fg2;
-            font-size: Theme.fs-small;
+            font-family: root.hint-mono ? Theme.font-mono : Theme.font;
+            font-size: root.hint-mono ? Theme.fs-mono : Theme.fs-small;
             wrap: word-wrap;
         }
     }
@@ -333,7 +356,7 @@ component Status inherits HorizontalLayout {
         Rectangle {
             width: 8px;
             height: 8px;
-            border-radius: 4px;
+            border-radius: min(4px, Theme.radius-pill);
             background: root.line.state == 2 ? Theme.ok : root.line.state == 3 ? Theme.err : Theme.fg2;
         }
     }
@@ -362,9 +385,9 @@ component KeyChip inherits Rectangle {
     in property <bool> capturing;
     callback clicked;
     height: 36px;
-    min-width: max(128px, t.preferred-width + 28px);
+    min-width: max(152px, t.preferred-width + 28px);
     horizontal-stretch: 0;
-    border-radius: 8px;
+    border-radius: Theme.radius;
     background: capturing ? Theme.accent : ka.has-hover ? Theme.control-hover : Theme.control;
     animate background { duration: 120ms; }
     t := Text {
@@ -372,7 +395,8 @@ component KeyChip inherits Rectangle {
         height: parent.height;
         text: root.capturing ? "Нажми сочетание…" : root.label;
         color: root.capturing ? Theme.on-accent : Theme.fg;
-        font-size: Theme.fs;
+        font-family: root.capturing ? Theme.font : Theme.font-mono;
+        font-size: root.capturing ? Theme.fs : Theme.fs-mono + 1px;
         font-weight: 600;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -389,10 +413,12 @@ component ListItem inherits Rectangle {
     in property <bool> active;
     in property <bool> pickable;
     in property <bool> removable: true;
+    // основная строка — имя exe
+    in property <bool> mono;
     callback pick;
     callback remove;
     height: sub != "" ? 48px : 40px;
-    border-radius: 8px;
+    border-radius: Theme.radius;
     background: active ? Theme.control : (pickable && ia.has-hover) ? Theme.control-hover : transparent;
     animate background { duration: 90ms; }
     ia := TouchArea {
@@ -409,12 +435,12 @@ component ListItem inherits Rectangle {
             Rectangle {
                 width: 18px;
                 height: 18px;
-                border-radius: 9px;
+                border-radius: min(9px, Theme.radius-pill);
                 background: root.active ? Theme.accent : Theme.control-strong;
                 Rectangle {
                     width: 6px;
                     height: 6px;
-                    border-radius: 3px;
+                    border-radius: min(3px, Theme.radius-pill);
                     background: Theme.on-accent;
                     visible: root.active;
                 }
@@ -426,14 +452,17 @@ component ListItem inherits Rectangle {
             Text {
                 text: root.text;
                 color: Theme.fg;
-                font-size: Theme.fs;
+                font-family: root.mono ? Theme.font-mono : Theme.font;
+                font-size: root.mono ? Theme.fs-mono + 1px : Theme.fs;
                 font-weight: root.active ? 600 : 400;
                 overflow: elide;
             }
+            // id модели
             if root.sub != "": Text {
                 text: root.sub;
                 color: Theme.fg2;
-                font-size: Theme.fs-small;
+                font-family: Theme.font-mono;
+                font-size: Theme.fs-mono - 1px;
                 overflow: elide;
             }
         }
@@ -442,7 +471,7 @@ component ListItem inherits Rectangle {
             Rectangle {
                 width: 32px;
                 height: 32px;
-                border-radius: 8px;
+                border-radius: Theme.radius;
                 background: xa.has-hover ? Theme.control-strong : transparent;
                 Path {
                     width: 10px;
@@ -467,7 +496,7 @@ component NavItem inherits Rectangle {
     in property <bool> selected;
     callback clicked;
     height: 40px;
-    border-radius: 10px;
+    border-radius: Theme.radius + 2px;
     background: selected ? Theme.control : na.has-hover ? Theme.card : transparent;
     animate background { duration: 90ms; }
     Text {
@@ -491,7 +520,7 @@ component PauseChip inherits Rectangle {
     in property <string> label;
     callback clicked;
     height: 52px;
-    border-radius: 12px;
+    border-radius: Theme.radius-card;
     background: paused ? (pa.has-hover ? Theme.accent-hover : Theme.accent) : (pa.has-hover ? Theme.control-hover : Theme.control);
     animate background { duration: 120ms; }
     HorizontalLayout {
@@ -503,7 +532,7 @@ component PauseChip inherits Rectangle {
             Rectangle {
                 width: 10px;
                 height: 10px;
-                border-radius: 5px;
+                border-radius: min(5px, Theme.radius-pill);
                 background: root.paused ? Theme.on-accent : Theme.accent;
             }
         }
@@ -571,6 +600,7 @@ export component SettingsWindow inherits Window {
     min-width: 640px;
     min-height: 460px;
     background: Theme.bg;
+    default-font-family: Theme.font;
     default-font-size: Theme.fs;
 
     HorizontalLayout {
@@ -593,6 +623,7 @@ export component SettingsWindow inherits Window {
                     Text {
                         text: "Verba";
                         color: Theme.fg;
+                        font-family: Theme.font;
                         font-size: 19px;
                         font-weight: 700;
                         vertical-alignment: center;
@@ -620,7 +651,8 @@ export component SettingsWindow inherits Window {
             Text {
                 text: ["Распознавание", "Хоткеи", "Вставка", "Звук", "Общее"][root.page];
                 color: Theme.fg;
-                font-size: 22px;
+                font-family: Theme.font;
+                font-size: Theme.fs-page;
                 font-weight: 700;
             }
             Flickable {
@@ -652,6 +684,7 @@ export component SettingsWindow inherits Window {
                             if root.view.key-mask != "" && !root.key-edit: Row {
                                 title: "Ключ OpenRouter";
                                 hint: root.view.key-mask;
+                                hint-mono: true;
                                 Btn {
                                     text: "Проверить";
                                     clicked => { root.act("key-check", ""); }
@@ -683,6 +716,7 @@ export component SettingsWindow inherits Window {
                                     spacing: 8px;
                                     Field {
                                         password: true;
+                                        mono: true;
                                         placeholder: "sk-or-v1-…";
                                         text <=> root.key-text;
                                         accepted => { root.act("key-save", root.key-text); }
@@ -729,6 +763,8 @@ export component SettingsWindow inherits Window {
                                     select(i) => { root.act("model-add", root.view.catalog[i]); }
                                 }
                                 Field {
+                                    mono: true;
+                                    mono-placeholder: false;
                                     placeholder: "или по имени";
                                     text <=> root.model-text;
                                     accepted => { root.act("model-add", root.model-text); }
@@ -764,6 +800,7 @@ export component SettingsWindow inherits Window {
                             if root.view.proxy != "" && !root.proxy-edit: Row {
                                 title: "Прокси";
                                 hint: root.view.proxy;
+                                hint-mono: true;
                                 Btn {
                                     text: "Проверить";
                                     clicked => { root.act("proxy-check", ""); }
@@ -786,6 +823,7 @@ export component SettingsWindow inherits Window {
                                 HorizontalLayout {
                                     spacing: 8px;
                                     Field {
+                                        mono: true;
                                         placeholder: "1.2.3.4:8080:логин:пароль";
                                         text <=> root.proxy-text;
                                         accepted => { root.act("proxy-check", root.proxy-text); }
@@ -863,7 +901,7 @@ export component SettingsWindow inherits Window {
                                 Rectangle {
                                     width: 96px;
                                     height: 36px;
-                                    border-radius: 8px;
+                                    border-radius: Theme.radius;
                                     background: Theme.control;
                                     Text {
                                         width: parent.width;
@@ -932,12 +970,14 @@ export component SettingsWindow inherits Window {
                                 spacing: 2px;
                                 for g in root.view.games: ListItem {
                                     text: g;
+                                    mono: true;
                                     remove => { root.act("game-remove", g); }
                                 }
                             }
                             HorizontalLayout {
                                 spacing: 8px;
                                 Field {
+                                    mono: true;
                                     placeholder: "game.exe";
                                     text <=> root.game-text;
                                     accepted => { root.act("game-add", root.game-text); }
