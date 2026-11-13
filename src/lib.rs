@@ -5,14 +5,17 @@ pub mod logger;
 
 pub mod app;
 pub mod audio;
+pub mod autostart;
 pub mod cli;
 pub mod config;
 pub mod controller;
 pub mod hotkey;
 pub mod icons;
 pub mod net;
+pub mod overlay;
 pub mod paste;
 pub mod secrets;
+pub mod settings;
 pub mod sound;
 pub mod target;
 pub mod tray;

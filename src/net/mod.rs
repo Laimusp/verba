@@ -374,6 +374,23 @@ impl Pool {
         tokio::time::timeout(wait, fut).await.map_err(|_| format!("нет ответа за {} с", wait.as_secs()))?
     }
 
+    /// Маленький GET через основной клиент: статус и тело JSON (не JSON — None).
+    pub async fn get_json(
+        &self,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+        wait: Duration,
+    ) -> Result<(u16, Option<serde_json::Value>), String> {
+        let slot = self.primary();
+        let fut = async {
+            let r = slot.client.get(url).headers(headers).send().await.map_err(|e| words::reqwest_why(&e))?;
+            let status = r.status().as_u16();
+            let body = r.bytes().await.map_err(|e| words::reqwest_why(&e))?;
+            Ok((status, serde_json::from_slice(&body).ok()))
+        };
+        tokio::time::timeout(wait, fut).await.map_err(|_| format!("нет ответа за {} с", wait.as_secs()))?
+    }
+
     /// Запись с повторами. Отказ сервиса (статус ≥ 400) — это `Ok(Answer)`.
     pub async fn send_hedged(&self, post: Post, hedge: Hedge) -> Result<Answer, Failure> {
         let wait = Duration::from_millis(hedge.wait_ms(post.body.len()));
@@ -546,6 +563,18 @@ impl OpenRouter {
         self.pool.get_status(&self.pool.url("/api/v1/key"), bearer(key), wait).await
     }
 
+    /// Модели распознавания речи: `GET /api/v1/models?output_modalities=transcription` → id и имя
+    /// (QED `service.ts:356`). Ключ не нужен; путь тот же, что у диктовки (прокси).
+    pub async fn models(&self, wait: Duration) -> Result<Vec<Model>, String> {
+        let url = self.pool.url("/api/v1/models?output_modalities=transcription");
+        let (status, json) = self.pool.get_json(&url, reqwest::header::HeaderMap::new(), wait).await?;
+        if status != 200 {
+            let said = words::or_message(json.as_ref());
+            return Err(if said.is_empty() { format!("OpenRouter ответил {status}") } else { format!("OpenRouter ответил {status}: {said}") });
+        }
+        parse_models(json.as_ref()).ok_or_else(|| "OpenRouter прислал список в незнакомом виде".to_string())
+    }
+
     /// Распознавание записи с повторами. Отказ сервиса (статус ≥ 400) — это `Ok(Answer)`.
     pub async fn transcribe(&self, key: &str, model: &str, wav: &[u8], hedge: Hedge) -> Result<Answer, Failure> {
         let mut headers = bearer(key);
@@ -570,8 +599,51 @@ pub async fn detect_proxy_kind(
     pass: Option<&str>,
     wait: Duration,
 ) -> Option<ProxyKind> {
+    probe_proxy(base_url, host, port, user, pass, &[ProxyKind::Http, ProxyKind::Socks5, ProxyKind::Socks4], wait)
+        .await
+        .map(|(k, _)| k)
+}
+
+/// Модель распознавания из списка OpenRouter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Model {
+    pub id: String,
+    pub name: String,
+}
+
+/// `{data: [{id, name}]}` → модели по алфавиту id без повторов; другой вид — None.
+pub fn parse_models(json: Option<&serde_json::Value>) -> Option<Vec<Model>> {
+    let data = json?.get("data")?.as_array()?;
+    let mut out: Vec<Model> = data
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let name = m.get("name").and_then(|n| n.as_str()).map(str::trim).filter(|n| !n.is_empty());
+            Some(Model { name: name.unwrap_or(&id).to_string(), id })
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.dedup_by(|a, b| a.id == b.id);
+    Some(out)
+}
+
+/// Проверка прокси: виды `kinds` пробуются сразу, побеждает первый, через который OpenRouter
+/// ответил JSON. Итог — вид и задержка до ответа по новому соединению (TCP + прокси + TLS + ответ).
+pub async fn probe_proxy(
+    base_url: &str,
+    host: &str,
+    port: u16,
+    user: Option<&str>,
+    pass: Option<&str>,
+    kinds: &[ProxyKind],
+    wait: Duration,
+) -> Option<(ProxyKind, u64)> {
+    let started = Instant::now();
     let mut set = tokio::task::JoinSet::new();
-    for kind in [ProxyKind::Http, ProxyKind::Socks5, ProxyKind::Socks4] {
+    for &kind in kinds {
         let route = Route { base_url: base_url.to_string(), proxy: Some(proxy::proxy_url(kind, host, port, user, pass)) };
         set.spawn(async move {
             let slot = Slot::build(&route).ok()?;
@@ -585,7 +657,7 @@ pub async fn detect_proxy_kind(
     let found = tokio::time::timeout(wait, async {
         while let Some(r) = set.join_next().await {
             if let Ok(Some(kind)) = r {
-                return Some(kind);
+                return Some((kind, started.elapsed().as_millis() as u64));
             }
         }
         None
@@ -624,6 +696,23 @@ pub fn timing_words(attempts: &[AttemptLog]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn models_list_parses_sorted_without_duplicates() {
+        let j = serde_json::json!({"data": [
+            {"id": "openai/whisper-1", "name": "OpenAI: Whisper"},
+            {"id": "a/b"},
+            {"id": "openai/whisper-1", "name": "дубль"},
+            {"id": "  "},
+            {"name": "без id"}
+        ]});
+        let m = parse_models(Some(&j)).unwrap();
+        assert_eq!(m.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["a/b", "openai/whisper-1"]);
+        assert_eq!(m[0].name, "a/b", "без имени — id");
+        assert_eq!(m[1].name, "OpenAI: Whisper");
+        assert!(parse_models(Some(&serde_json::json!({"error": "x"}))).is_none());
+        assert!(parse_models(None).is_none());
+    }
 
     #[test]
     fn hedge_wait_grows_with_body() {

@@ -1,4 +1,5 @@
-//! Вшивает иконку `assets/verba.ico` в verba.exe: её показывают рабочий стол, панель задач и проводник.
+//! Собирает окно настроек (`ui/settings.slint`) и вшивает иконку `assets/verba.ico` в verba.exe: её
+//! показывают рабочий стол, панель задач и проводник.
 //!
 //! Ресурс (.res) собирается здесь же: пустая запись, по RT_ICON на картинку и RT_GROUP_ICON с их списком.
 //! Компоновщик MSVC принимает .res на вход сам (документ «.Res Files as Linker Input»), поэтому rc.exe и
@@ -14,6 +15,9 @@ const LANG: u16 = 0x0409;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/verba.ico");
+    // окно настроек: .slint → Rust; стиль fluent — палитра светлой и тёмной темы по системе
+    let slint = slint_build::CompilerConfiguration::new().with_style("fluent".into());
+    slint_build::compile_with_config("ui/settings.slint", slint).expect("ui/settings.slint не собирается");
     let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") || !msvc {
         println!("cargo:warning=иконка не вшита: .res принимает только компоновщик MSVC (x86_64-pc-windows-msvc)");

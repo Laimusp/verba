@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use super::app_server::{AppServer, Timeouts};
 use super::codex::{self, Codex, CodexSetup, Renewer};
-use super::{detect_proxy_kind, Answer, Failure, Hedge, OpenRouter, Route, Warm};
+use super::{detect_proxy_kind, probe_proxy, Answer, Failure, Hedge, Model, OpenRouter, Route, Warm};
 use crate::config::{Engine, ProxyKind};
 
 /// Чем распознавать запись.
@@ -33,6 +33,10 @@ pub enum NetCmd {
     CheckCodex,
     /// узнать вид прокси (строка его не назвала)
     DetectProxy { base_url: String, host: String, port: u16, user: Option<String>, pass: Option<String> },
+    /// список моделей распознавания OpenRouter (окно настроек)
+    ListModels,
+    /// проверить прокси из окна настроек: вид (если не назван) и задержка до OpenRouter
+    CheckProxy { base_url: String, host: String, port: u16, user: Option<String>, pass: Option<String>, kind: Option<ProxyKind> },
 }
 
 pub enum NetEvent {
@@ -50,6 +54,9 @@ pub enum NetEvent {
     KeyChecked(Result<(u16, u64), String>),
     CodexChecked(Result<codex::Checked, String>),
     RouteError(String),
+    Models(Result<Vec<Model>, String>),
+    /// итог проверки прокси: вид и задержка, мс; None — не ответил ни одним видом
+    ProxyChecked { host: String, port: u16, result: Option<(ProxyKind, u64)> },
 }
 
 #[derive(Clone)]
@@ -186,6 +193,36 @@ impl NetService {
                             tokio::spawn(async move {
                                 let r = c.check(Hedge::default()).await;
                                 let _ = ev.send(NetEvent::CodexChecked(r));
+                            });
+                        }
+                        NetCmd::ListModels => {
+                            let ev = events.clone();
+                            let Some(o) = or.clone() else {
+                                let _ = ev.send(NetEvent::Models(Err("сеть не настроена".into())));
+                                continue;
+                            };
+                            tokio::spawn(async move {
+                                let _ = ev.send(NetEvent::Models(o.models(Duration::from_secs(15)).await));
+                            });
+                        }
+                        NetCmd::CheckProxy { base_url, host, port, user, pass, kind } => {
+                            let ev = events.clone();
+                            tokio::spawn(async move {
+                                let kinds = match kind {
+                                    Some(k) => vec![k],
+                                    None => vec![ProxyKind::Http, ProxyKind::Socks5, ProxyKind::Socks4],
+                                };
+                                let result = probe_proxy(
+                                    &base_url,
+                                    &host,
+                                    port,
+                                    user.as_deref(),
+                                    pass.as_deref(),
+                                    &kinds,
+                                    Duration::from_secs(12),
+                                )
+                                .await;
+                                let _ = ev.send(NetEvent::ProxyChecked { host, port, result });
                             });
                         }
                         NetCmd::DetectProxy { base_url, host, port, user, pass } => {

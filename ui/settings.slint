@@ -1,0 +1,1097 @@
+// Окно настроек Verba. Слово владельца (12.11.2026): красиво и минималистично, в цветах знака —
+// коралл, белый, чёрный; тонких линий нет совсем (группы — заливкой, состояние — цветом заливки);
+// окно небольшое, но кнопки и текст не мелкие; меньше текста, больше смысла.
+// Всё, что показывает окно, приходит из Rust одной структурой View; действия уходят callback-ом act.
+
+import { Palette } from "std-widgets.slint";
+
+export global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <color> bg: dark ? #1b1917 : #ffffff;
+    out property <color> nav: dark ? #151311 : #f6f3f0;
+    out property <color> card: dark ? #252220 : #f6f3f0;
+    out property <color> control: dark ? #34302d : #ebe5e0;
+    out property <color> control-hover: dark ? #3e3a36 : #e2dbd5;
+    out property <color> control-strong: dark ? #4b4541 : #d3cbc4;
+    out property <color> popup: dark ? #34302d : #ffffff;
+    out property <color> fg: dark ? #f5f1ed : #1b1917;
+    out property <color> fg2: dark ? #a39a93 : #6f6660;
+    out property <color> accent: #e5484d;
+    out property <color> accent-hover: #ec5b60;
+    out property <color> accent-pressed: #cf3c41;
+    out property <color> on-accent: #ffffff;
+    out property <color> ok: dark ? #63c784 : #2b8a48;
+    out property <color> err: dark ? #ff8286 : #cc2f35;
+    out property <length> fs: 14px;
+    out property <length> fs-small: 13px;
+    out property <length> fs-title: 15px;
+}
+
+export struct Line {
+    // 0 — нет строки, 1 — идёт, 2 — хорошо, 3 — ошибка
+    state: int,
+    text: string,
+}
+
+export struct ModelRow {
+    id: string,
+    name: string,
+    active: bool,
+}
+
+export struct HotkeyRow {
+    title: string,
+    hint: string,
+    label: string,
+    capturing: bool,
+    warn: string,
+}
+
+export struct View {
+    paused: bool,
+    dictate-label: string,
+    codex: bool,
+    key-mask: string,
+    key-line: Line,
+    models: [ModelRow],
+    catalog: [string],
+    catalog-line: Line,
+    proxy: string,
+    proxy-line: Line,
+    proxy-unsaved: bool,
+    codex-login: Line,
+    codex-line: Line,
+    hotkeys: [HotkeyRow],
+    mode: int,
+    hold-ms: int,
+    remember-field: bool,
+    trailing-space: bool,
+    restore-clipboard: bool,
+    games: [string],
+    devices: [string],
+    device: int,
+    keep-open: bool,
+    snd-rec: bool,
+    snd-pause: bool,
+    snd-err: bool,
+    overlay: int,
+    autostart: bool,
+    autostart-busy: bool,
+    autostart-line: Line,
+    restart-elevated: bool,
+    version: string,
+}
+
+component Btn inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> danger;
+    in property <bool> enabled: true;
+    callback clicked;
+    height: 36px;
+    min-width: max(84px, label.preferred-width + 32px);
+    horizontal-stretch: 0;
+    border-radius: 8px;
+    opacity: enabled ? 1 : 0.45;
+    background: (primary || danger) && enabled
+        ? (ta.pressed ? Theme.accent-pressed : ta.has-hover ? Theme.accent-hover : Theme.accent)
+        : (ta.pressed && enabled ? Theme.control-strong : ta.has-hover && enabled ? Theme.control-hover : Theme.control);
+    animate background { duration: 90ms; }
+    label := Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.text;
+        color: (root.primary || root.danger) && root.enabled ? Theme.on-accent : Theme.fg;
+        font-size: Theme.fs;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Field inherits Rectangle {
+    in property <string> placeholder;
+    in property <bool> password;
+    in-out property <string> text <=> input.text;
+    callback accepted;
+    height: 36px;
+    min-width: 120px;
+    horizontal-stretch: 1;
+    border-radius: 8px;
+    background: input.has-focus ? Theme.control-hover : Theme.control;
+    animate background { duration: 90ms; }
+    input := TextInput {
+        x: 12px;
+        width: parent.width - 24px;
+        height: parent.height;
+        vertical-alignment: center;
+        single-line: true;
+        color: Theme.fg;
+        font-size: Theme.fs;
+        input-type: root.password ? InputType.password : InputType.text;
+        selection-background-color: Theme.accent;
+        selection-foreground-color: Theme.on-accent;
+        accepted => { root.accepted(); }
+    }
+    if input.text == "": Text {
+        x: 12px;
+        width: parent.width - 24px;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.placeholder;
+        color: Theme.fg2;
+        font-size: Theme.fs;
+        overflow: elide;
+    }
+}
+
+component Toggle inherits Rectangle {
+    in property <bool> on;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+    width: 44px;
+    height: 24px;
+    border-radius: 12px;
+    opacity: enabled ? 1 : 0.45;
+    background: on ? (ta.has-hover ? Theme.accent-hover : Theme.accent) : (ta.has-hover ? Theme.control-strong : Theme.control-strong);
+    animate background { duration: 120ms; }
+    Rectangle {
+        y: 3px;
+        x: root.on ? root.width - self.width - 3px : 3px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: root.on ? Theme.on-accent : Theme.fg2;
+        animate x { duration: 120ms; easing: ease-out; }
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.toggled(!root.on); }
+    }
+}
+
+component Segmented inherits Rectangle {
+    in property <[string]> options;
+    in property <int> selected;
+    callback select(int);
+    height: 36px;
+    border-radius: 10px;
+    background: Theme.control;
+    HorizontalLayout {
+        padding: 3px;
+        spacing: 3px;
+        for o[i] in root.options: Rectangle {
+            border-radius: 8px;
+            min-width: t.preferred-width + 28px;
+            background: i == root.selected ? Theme.accent : sa.has-hover ? Theme.control-hover : transparent;
+            animate background { duration: 120ms; }
+            t := Text {
+                width: parent.width;
+                height: parent.height;
+                text: o;
+                color: i == root.selected ? Theme.on-accent : Theme.fg;
+                font-size: Theme.fs;
+                font-weight: i == root.selected ? 600 : 400;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            sa := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.select(i); }
+            }
+        }
+    }
+}
+
+component Select inherits Rectangle {
+    in property <[string]> options;
+    in property <int> selected: -1;
+    in property <string> placeholder;
+    in property <bool> enabled: true;
+    callback select(int);
+    height: 36px;
+    min-width: 160px;
+    horizontal-stretch: 1;
+    border-radius: 8px;
+    opacity: enabled ? 1 : 0.6;
+    background: ta.has-hover && enabled ? Theme.control-hover : Theme.control;
+    Text {
+        x: 12px;
+        width: parent.width - 44px;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.selected >= 0 && root.selected < root.options.length ? root.options[root.selected] : root.placeholder;
+        color: root.selected >= 0 ? Theme.fg : Theme.fg2;
+        font-size: Theme.fs;
+        overflow: elide;
+    }
+    Path {
+        x: parent.width - 26px;
+        y: (parent.height - 7px) / 2;
+        width: 12px;
+        height: 7px;
+        viewbox-width: 12;
+        viewbox-height: 7;
+        commands: "M 1 1 L 6 6 L 11 1";
+        stroke: Theme.fg2;
+        stroke-width: 2px;
+        fill: transparent;
+    }
+    ta := TouchArea {
+        enabled: root.enabled && root.options.length > 0;
+        mouse-cursor: pointer;
+        clicked => { popup.show(); }
+    }
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: root.width;
+        height: min(root.options.length * 36px + 8px, 296px);
+        Rectangle {
+            background: Theme.popup;
+            border-radius: 10px;
+            Flickable {
+                content-height: list.preferred-height;
+                list := VerticalLayout {
+                    padding: 4px;
+                    for o[i] in root.options: Rectangle {
+                        height: 36px;
+                        border-radius: 8px;
+                        background: i == root.selected ? Theme.control : oa.has-hover ? Theme.control-hover : transparent;
+                        Text {
+                            x: 10px;
+                            width: parent.width - 20px;
+                            height: parent.height;
+                            vertical-alignment: center;
+                            text: o;
+                            color: Theme.fg;
+                            font-size: Theme.fs;
+                            overflow: elide;
+                        }
+                        oa := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.select(i); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component Card inherits Rectangle {
+    background: Theme.card;
+    border-radius: 12px;
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+        @children
+    }
+}
+
+component Title inherits Text {
+    color: Theme.fg;
+    font-size: Theme.fs-title;
+    font-weight: 600;
+    wrap: word-wrap;
+}
+
+component Row inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> hint;
+    in property <bool> hint-err;
+    spacing: 8px;
+    VerticalLayout {
+        alignment: center;
+        spacing: 2px;
+        horizontal-stretch: 1;
+        min-width: 140px;
+        Title { text: root.title; }
+        if root.hint != "": Text {
+            text: root.hint;
+            color: root.hint-err ? Theme.err : Theme.fg2;
+            font-size: Theme.fs-small;
+            wrap: word-wrap;
+        }
+    }
+    @children
+}
+
+component Status inherits HorizontalLayout {
+    in property <Line> line;
+    spacing: 8px;
+    horizontal-stretch: 1;
+    VerticalLayout {
+        padding-top: 5px;
+        alignment: start;
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: root.line.state == 2 ? Theme.ok : root.line.state == 3 ? Theme.err : Theme.fg2;
+        }
+    }
+    Text {
+        horizontal-stretch: 1;
+        text: root.line.text;
+        color: root.line.state == 3 ? Theme.err : Theme.fg2;
+        font-size: Theme.fs-small;
+        wrap: word-wrap;
+        vertical-alignment: center;
+    }
+}
+
+component Link inherits Text {
+    callback clicked;
+    color: la.has-hover ? Theme.accent-hover : Theme.accent;
+    font-size: Theme.fs-small;
+    la := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component KeyChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> capturing;
+    callback clicked;
+    height: 36px;
+    min-width: max(128px, t.preferred-width + 28px);
+    horizontal-stretch: 0;
+    border-radius: 8px;
+    background: capturing ? Theme.accent : ka.has-hover ? Theme.control-hover : Theme.control;
+    animate background { duration: 120ms; }
+    t := Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.capturing ? "Нажми сочетание…" : root.label;
+        color: root.capturing ? Theme.on-accent : Theme.fg;
+        font-size: Theme.fs;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ka := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component ListItem inherits Rectangle {
+    in property <string> text;
+    in property <string> sub;
+    in property <bool> active;
+    in property <bool> pickable;
+    in property <bool> removable: true;
+    callback pick;
+    callback remove;
+    height: sub != "" ? 48px : 40px;
+    border-radius: 8px;
+    background: active ? Theme.control : (pickable && ia.has-hover) ? Theme.control-hover : transparent;
+    animate background { duration: 90ms; }
+    ia := TouchArea {
+        enabled: root.pickable;
+        mouse-cursor: root.pickable ? pointer : default;
+        clicked => { root.pick(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 4px;
+        spacing: 10px;
+        if root.pickable: VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                border-radius: 9px;
+                background: root.active ? Theme.accent : Theme.control-strong;
+                Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: Theme.on-accent;
+                    visible: root.active;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: root.text;
+                color: Theme.fg;
+                font-size: Theme.fs;
+                font-weight: root.active ? 600 : 400;
+                overflow: elide;
+            }
+            if root.sub != "": Text {
+                text: root.sub;
+                color: Theme.fg2;
+                font-size: Theme.fs-small;
+                overflow: elide;
+            }
+        }
+        if root.removable && !root.active: VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: 8px;
+                background: xa.has-hover ? Theme.control-strong : transparent;
+                Path {
+                    width: 10px;
+                    height: 10px;
+                    viewbox-width: 10;
+                    viewbox-height: 10;
+                    commands: "M 1 1 L 9 9 M 9 1 L 1 9";
+                    stroke: xa.has-hover ? Theme.fg : Theme.fg2;
+                    stroke-width: 2px;
+                }
+                xa := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.remove(); }
+                }
+            }
+        }
+    }
+}
+
+component NavItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked;
+    height: 40px;
+    border-radius: 10px;
+    background: selected ? Theme.control : na.has-hover ? Theme.card : transparent;
+    animate background { duration: 90ms; }
+    Text {
+        x: 14px;
+        width: parent.width - 28px;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.text;
+        color: root.selected ? Theme.fg : Theme.fg2;
+        font-size: Theme.fs;
+        font-weight: root.selected ? 600 : 400;
+    }
+    na := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component PauseChip inherits Rectangle {
+    in property <bool> paused;
+    in property <string> label;
+    callback clicked;
+    height: 52px;
+    border-radius: 12px;
+    background: paused ? (pa.has-hover ? Theme.accent-hover : Theme.accent) : (pa.has-hover ? Theme.control-hover : Theme.control);
+    animate background { duration: 120ms; }
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 12px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                border-radius: 5px;
+                background: root.paused ? Theme.on-accent : Theme.accent;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: root.paused ? "Пауза" : "Слушаю";
+                color: root.paused ? Theme.on-accent : Theme.fg;
+                font-size: Theme.fs;
+                font-weight: 600;
+            }
+            Text {
+                text: root.paused ? "Нажми, чтобы слушать" : root.label;
+                color: root.paused ? Theme.on-accent : Theme.fg2;
+                font-size: Theme.fs-small;
+                overflow: elide;
+            }
+        }
+    }
+    pa := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component SettingsWindow inherits Window {
+    in property <View> view;
+    in property <image> logo;
+    callback act(string, string);
+
+    property <int> page: 0;
+    property <bool> key-edit;
+    property <bool> key-confirm;
+    property <string> key-text;
+    property <bool> proxy-edit;
+    property <string> proxy-text;
+    property <string> model-text;
+    property <string> game-text;
+
+    // Rust зовёт после успеха: поле ввода очищается, форма закрывается
+    public function key-saved() {
+        root.key-edit = false;
+        root.key-text = "";
+        root.key-confirm = false;
+    }
+    public function proxy-saved() {
+        root.proxy-edit = false;
+        root.proxy-text = "";
+    }
+    public function model-added() {
+        root.model-text = "";
+    }
+    public function game-added() {
+        root.game-text = "";
+    }
+    public function show-page(p: int) {
+        root.page = p;
+    }
+
+    title: "Настройки Verba";
+    icon: root.logo;
+    preferred-width: 760px;
+    preferred-height: 580px;
+    min-width: 640px;
+    min-height: 460px;
+    background: Theme.bg;
+    default-font-size: Theme.fs;
+
+    HorizontalLayout {
+        Rectangle {
+            width: 208px;
+            background: Theme.nav;
+            VerticalLayout {
+                padding: 16px;
+                padding-top: 20px;
+                spacing: 4px;
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-bottom: 18px;
+                    spacing: 10px;
+                    Image {
+                        source: root.logo;
+                        width: 30px;
+                        height: 30px;
+                    }
+                    Text {
+                        text: "Verba";
+                        color: Theme.fg;
+                        font-size: 19px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                }
+                for item[i] in ["Распознавание", "Хоткеи", "Вставка", "Звук", "Общее"]: NavItem {
+                    text: item;
+                    selected: root.page == i;
+                    clicked => { root.page = i; }
+                }
+                Rectangle { vertical-stretch: 1; }
+                PauseChip {
+                    paused: root.view.paused;
+                    label: root.view.dictate-label;
+                    clicked => { root.act("pause", ""); }
+                }
+            }
+        }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            padding: 24px;
+            padding-bottom: 0px;
+            spacing: 16px;
+            Text {
+                text: ["Распознавание", "Хоткеи", "Вставка", "Звук", "Общее"][root.page];
+                color: Theme.fg;
+                font-size: 22px;
+                font-weight: 700;
+            }
+            Flickable {
+                vertical-stretch: 1;
+                content-height: body.preferred-height + 24px;
+                body := VerticalLayout {
+                    width: parent.width;
+                    spacing: 12px;
+                    alignment: start;
+
+                    // ---------- Распознавание ----------
+                    if root.page == 0: VerticalLayout {
+                        spacing: 12px;
+                        Card {
+                            Row {
+                                title: "Чем распознавать";
+                                hint: root.view.codex ? "По подписке ChatGPT, без ключа" : "По твоему ключу, оплата с его счёта";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Segmented {
+                                        options: ["OpenRouter", "ChatGPT"];
+                                        selected: root.view.codex ? 1 : 0;
+                                        select(i) => { root.act("engine", i == 1 ? "codex" : "openrouter"); }
+                                    }
+                                }
+                            }
+                        }
+                        if !root.view.codex: Card {
+                            if root.view.key-mask != "" && !root.key-edit: Row {
+                                title: "Ключ OpenRouter";
+                                hint: root.view.key-mask;
+                                Btn {
+                                    text: "Проверить";
+                                    clicked => { root.act("key-check", ""); }
+                                }
+                                Btn {
+                                    text: "Заменить";
+                                    clicked => {
+                                        root.key-edit = true;
+                                        root.key-confirm = false;
+                                    }
+                                }
+                                Btn {
+                                    text: root.key-confirm ? "Точно убрать" : "Убрать";
+                                    danger: root.key-confirm;
+                                    clicked => {
+                                        if (root.key-confirm) {
+                                            root.key-confirm = false;
+                                            root.act("key-remove", "");
+                                        } else {
+                                            root.key-confirm = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if root.view.key-mask == "" || root.key-edit: VerticalLayout {
+                                spacing: 10px;
+                                Title { text: "Ключ OpenRouter"; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Field {
+                                        password: true;
+                                        placeholder: "sk-or-v1-…";
+                                        text <=> root.key-text;
+                                        accepted => { root.act("key-save", root.key-text); }
+                                    }
+                                    Btn {
+                                        primary: true;
+                                        text: "Сохранить";
+                                        enabled: root.key-text != "";
+                                        clicked => { root.act("key-save", root.key-text); }
+                                    }
+                                    if root.key-edit: Btn {
+                                        text: "Отмена";
+                                        clicked => {
+                                            root.key-edit = false;
+                                            root.key-text = "";
+                                        }
+                                    }
+                                }
+                                Link {
+                                    text: "Где взять ключ — openrouter.ai/settings/keys";
+                                    clicked => { root.act("url", "https://openrouter.ai/settings/keys"); }
+                                }
+                            }
+                            if root.view.key-line.state != 0: Status { line: root.view.key-line; }
+                        }
+                        if !root.view.codex: Card {
+                            Title { text: "Модель"; }
+                            VerticalLayout {
+                                spacing: 2px;
+                                for m in root.view.models: ListItem {
+                                    text: m.name;
+                                    sub: m.name != m.id ? m.id : "";
+                                    active: m.active;
+                                    pickable: true;
+                                    pick => { root.act("model-active", m.id); }
+                                    remove => { root.act("model-remove", m.id); }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Select {
+                                    options: root.view.catalog;
+                                    placeholder: root.view.catalog-line.state == 1 ? "Спрашиваю OpenRouter…" : root.view.catalog.length == 0 ? "Все уже здесь" : "Из списка OpenRouter";
+                                    select(i) => { root.act("model-add", root.view.catalog[i]); }
+                                }
+                                Field {
+                                    placeholder: "или по имени";
+                                    text <=> root.model-text;
+                                    accepted => { root.act("model-add", root.model-text); }
+                                }
+                                Btn {
+                                    text: "Добавить";
+                                    enabled: root.model-text != "";
+                                    clicked => { root.act("model-add", root.model-text); }
+                                }
+                            }
+                            if root.view.catalog-line.state == 3: HorizontalLayout {
+                                spacing: 8px;
+                                Status { line: root.view.catalog-line; }
+                                Btn {
+                                    text: "Повторить";
+                                    clicked => { root.act("models-refresh", ""); }
+                                }
+                            }
+                        }
+                        if root.view.codex: Card {
+                            Row {
+                                title: "Вход Codex";
+                                hint: root.view.codex-login.text;
+                                hint-err: root.view.codex-login.state == 3;
+                                Btn {
+                                    text: "Проверить";
+                                    clicked => { root.act("codex-check", ""); }
+                                }
+                            }
+                            if root.view.codex-line.state != 0: Status { line: root.view.codex-line; }
+                        }
+                        Card {
+                            if root.view.proxy != "" && !root.proxy-edit: Row {
+                                title: "Прокси";
+                                hint: root.view.proxy;
+                                Btn {
+                                    text: "Проверить";
+                                    clicked => { root.act("proxy-check", ""); }
+                                }
+                                Btn {
+                                    text: "Заменить";
+                                    clicked => { root.proxy-edit = true; }
+                                }
+                                Btn {
+                                    text: "Убрать";
+                                    clicked => { root.act("proxy-remove", ""); }
+                                }
+                            }
+                            if root.view.proxy == "" || root.proxy-edit: VerticalLayout {
+                                spacing: 10px;
+                                Row {
+                                    title: "Прокси";
+                                    hint: root.view.proxy == "" ? "Нет — напрямую. Вставь строку как с сайта" : "Вставь строку как с сайта, вид определится сам";
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Field {
+                                        placeholder: "1.2.3.4:8080:логин:пароль";
+                                        text <=> root.proxy-text;
+                                        accepted => { root.act("proxy-check", root.proxy-text); }
+                                    }
+                                    Btn {
+                                        primary: true;
+                                        text: "Проверить";
+                                        enabled: root.proxy-text != "";
+                                        clicked => { root.act("proxy-check", root.proxy-text); }
+                                    }
+                                    if root.proxy-edit: Btn {
+                                        text: "Отмена";
+                                        clicked => {
+                                            root.proxy-edit = false;
+                                            root.proxy-text = "";
+                                        }
+                                    }
+                                }
+                            }
+                            if root.view.proxy-line.state != 0: HorizontalLayout {
+                                spacing: 8px;
+                                Status { line: root.view.proxy-line; }
+                                if root.view.proxy-unsaved: Btn {
+                                    text: "Сохранить всё равно";
+                                    clicked => { root.act("proxy-save-anyway", ""); }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---------- Хоткеи ----------
+                    if root.page == 1: VerticalLayout {
+                        spacing: 12px;
+                        Card {
+                            for h[i] in root.view.hotkeys: VerticalLayout {
+                                spacing: 4px;
+                                Row {
+                                    title: h.title;
+                                    hint: h.hint;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        KeyChip {
+                                            label: h.label;
+                                            capturing: h.capturing;
+                                            clicked => { root.act(h.capturing ? "capture-cancel" : "capture", "\{i}"); }
+                                        }
+                                    }
+                                }
+                                if h.warn != "": Text {
+                                    text: h.warn;
+                                    color: Theme.err;
+                                    font-size: Theme.fs-small;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        Card {
+                            Row {
+                                title: "Режим";
+                                hint: ["Пишет, пока сочетание нажато", "Нажал — пишет, нажал ещё — отправил", "Коротко — как «нажал-включил», долго — как «держать»"][root.view.mode];
+                            }
+                            Segmented {
+                                options: ["Держать", "Нажал — включил", "Гибрид"];
+                                selected: root.view.mode;
+                                select(i) => { root.act("mode", "\{i}"); }
+                            }
+                            if root.view.mode == 2: Row {
+                                title: "Короткое нажатие";
+                                hint: "Короче этого — запись остаётся включённой";
+                                Btn {
+                                    text: "−";
+                                    min-width: 40px;
+                                    clicked => { root.act("hold-ms", "\{root.view.hold-ms - 50}"); }
+                                }
+                                Rectangle {
+                                    width: 96px;
+                                    height: 36px;
+                                    border-radius: 8px;
+                                    background: Theme.control;
+                                    Text {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        text: "\{root.view.hold-ms} мс";
+                                        color: Theme.fg;
+                                        font-size: Theme.fs;
+                                        font-weight: 600;
+                                    }
+                                }
+                                Btn {
+                                    text: "+";
+                                    min-width: 40px;
+                                    clicked => { root.act("hold-ms", "\{root.view.hold-ms + 50}"); }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---------- Вставка ----------
+                    if root.page == 2: VerticalLayout {
+                        spacing: 12px;
+                        Card {
+                            Row {
+                                title: "В поле, где был курсор";
+                                hint: "Даже если ушёл в другое окно, пока Verba распознаёт";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.view.remember-field;
+                                        toggled(v) => { root.act("flag", v ? "remember_field=1" : "remember_field=0"); }
+                                    }
+                                }
+                            }
+                            Row {
+                                title: "Пробел после текста";
+                                hint: "Следующая диктовка не слипнется с этой";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.view.trailing-space;
+                                        toggled(v) => { root.act("flag", v ? "trailing_space=1" : "trailing_space=0"); }
+                                    }
+                                }
+                            }
+                            Row {
+                                title: "Вернуть буфер обмена";
+                                hint: "После вставки в буфере снова то, что было";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.view.restore-clipboard;
+                                        toggled(v) => { root.act("flag", v ? "restore_clipboard=1" : "restore_clipboard=0"); }
+                                    }
+                                }
+                            }
+                        }
+                        Card {
+                            Row {
+                                title: "Игры";
+                                hint: "В игру текст встаёт, только если фокус уже в её чате. Полноэкранные окна — игры и без списка";
+                            }
+                            VerticalLayout {
+                                spacing: 2px;
+                                for g in root.view.games: ListItem {
+                                    text: g;
+                                    remove => { root.act("game-remove", g); }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Field {
+                                    placeholder: "game.exe";
+                                    text <=> root.game-text;
+                                    accepted => { root.act("game-add", root.game-text); }
+                                }
+                                Btn {
+                                    text: "Добавить";
+                                    enabled: root.game-text != "";
+                                    clicked => { root.act("game-add", root.game-text); }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---------- Звук ----------
+                    if root.page == 3: VerticalLayout {
+                        spacing: 12px;
+                        Card {
+                            Row {
+                                title: "Микрофон";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Select {
+                                        width: 280px;
+                                        options: root.view.devices;
+                                        selected: root.view.device;
+                                        select(i) => { root.act("device", "\{i}"); }
+                                    }
+                                }
+                            }
+                            Row {
+                                title: "Держать открытым";
+                                hint: "Первые слова не теряются; значок микрофона в Windows горит всегда";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.view.keep-open;
+                                        toggled(v) => { root.act("flag", v ? "keep_open=1" : "keep_open=0"); }
+                                    }
+                                }
+                            }
+                        }
+                        Card {
+                            Row {
+                                title: "Плашка записи";
+                                hint: "Волна и время, пока говоришь";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Segmented {
+                                        options: ["Внизу", "Вверху", "Нет"];
+                                        selected: root.view.overlay;
+                                        select(i) => { root.act("overlay", "\{i}"); }
+                                    }
+                                }
+                            }
+                        }
+                        Card {
+                            Row {
+                                title: "Звук начала и конца записи";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.view.snd-rec;
+                                        toggled(v) => { root.act("flag", v ? "snd_rec=1" : "snd_rec=0"); }
+                                    }
+                                }
+                            }
+                            Row {
+                                title: "Звук паузы";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.view.snd-pause;
+                                        toggled(v) => { root.act("flag", v ? "snd_pause=1" : "snd_pause=0"); }
+                                    }
+                                }
+                            }
+                            Row {
+                                title: "Звук ошибки";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.view.snd-err;
+                                        toggled(v) => { root.act("flag", v ? "snd_err=1" : "snd_err=0"); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---------- Общее ----------
+                    if root.page == 4: VerticalLayout {
+                        spacing: 12px;
+                        Card {
+                            Row {
+                                title: "Запускать с Windows";
+                                hint: "С правами администратора: хоткей работает и в играх с правами. Windows спросит один раз";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        on: root.view.autostart;
+                                        enabled: !root.view.autostart-busy;
+                                        toggled(v) => { root.act("autostart", v ? "1" : "0"); }
+                                    }
+                                }
+                            }
+                            if root.view.autostart-line.state != 0: Status { line: root.view.autostart-line; }
+                            if root.view.restart-elevated: Row {
+                                title: "Сейчас Verba без прав";
+                                hint: "Права появятся после перезапуска";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Btn {
+                                        primary: true;
+                                        text: "Перезапустить";
+                                        clicked => { root.act("restart", ""); }
+                                    }
+                                }
+                            }
+                        }
+                        Card {
+                            Title { text: "Файлы"; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                Btn {
+                                    text: "Лог";
+                                    clicked => { root.act("open-log", ""); }
+                                }
+                                Btn {
+                                    text: "config.json";
+                                    clicked => { root.act("open-config", ""); }
+                                }
+                                Btn {
+                                    text: "Ярлык на рабочий стол";
+                                    clicked => { root.act("shortcut", ""); }
+                                }
+                            }
+                        }
+                        Card {
+                            Row {
+                                title: "Verba \{root.view.version}";
+                                hint: "Интерфейс — Slint";
+                                VerticalLayout {
+                                    alignment: center;
+                                    Btn {
+                                        text: "Выйти";
+                                        clicked => { root.act("exit", ""); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

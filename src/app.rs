@@ -1,49 +1,148 @@
-//! Запуск приложения: один экземпляр, потоки, трей на главном потоке.
+//! Запуск приложения: один экземпляр, потоки, трей и окно настроек на главном потоке.
 //!
-//! Потоки: главный — трей (цикл сообщений Win32); хук клавиатуры; контроллер; микрофон;
-//! сеть (tokio на одном потоке); лог. В простое все ждут на своих очередях — 0 % CPU.
+//! Потоки: главный — цикл Slint (он же раздаёт сообщения окну трея); хук клавиатуры; контроллер;
+//! микрофон; сеть (tokio на одном потоке); оверлей; лог. В простое все ждут на своих очередях — 0 % CPU.
+//!
+//! Запуск руками (`verba.exe`) открывает окно настроек; из автозапуска (`verba.exe --tray`) — только
+//! значок в трее. Второй запуск не стартует второй экземпляр, а просит первый показать окно. Если
+//! включён автозапуск с правами, а Verba запустили без прав, — она запускает себя через задачу
+//! планировщика (с правами, без окна UAC) и сама выходит.
 
-use std::time::Instant;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, LPARAM, WPARAM};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, LPARAM, WPARAM};
+use windows::Win32::System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, FindWindowW, PostMessageW, ASFW_ANY};
 
 use crate::audio::recorder::{self, AudioCmd};
+use crate::autostart;
 use crate::config::{self, Config, Paths};
 use crate::controller::{Channels, Controller, Parts};
-use crate::hotkey::hook::{HookThread, MATCHER};
+use crate::hotkey::hook::{self, HookThread, MATCHER};
 use crate::net::service::NetService;
 use crate::net::Route;
+use crate::overlay::Overlay;
+use crate::settings;
 use crate::target::TargetService;
 use crate::tray::{self, UiState};
 use crate::{error, info, logger, warn};
 
-/// Второй экземпляр не запускается: он просит первый показать уведомление и выходит.
-fn single_instance() -> bool {
-    let name: Vec<u16> = "Local\\Verba.SingleInstance".encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        // хэндл не закрываем: мьютекс живёт, пока жив процесс
-        let _mutex = CreateMutexW(None, false, PCWSTR(name.as_ptr()));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            if let Ok(hwnd) = FindWindowW(tray::WINDOW_CLASS, PCWSTR::null()) {
-                let _ = PostMessageW(Some(hwnd), tray::WM_SECOND_INSTANCE, WPARAM(0), LPARAM(0));
-            }
-            return false;
-        }
-    }
-    true
+const MUTEX: &str = "Local\\Verba.SingleInstance";
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-pub fn run() -> i32 {
-    if !single_instance() {
-        return 0;
+/// Другой экземпляр уже работает. Мьютекс экземпляра с правами процессу без прав не открыть —
+/// отказ в доступе значит то же: экземпляр есть.
+fn other_running(name: &[u16]) -> bool {
+    unsafe {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(e) => e.code() == ERROR_ACCESS_DENIED.to_hresult(),
+        }
     }
+}
+
+/// Занять мьютекс экземпляра; хэндл не закрываем — мьютекс живёт, пока жив процесс.
+fn take_mutex(name: &[u16]) -> bool {
+    unsafe {
+        match CreateMutexW(None, false, PCWSTR(name.as_ptr())) {
+            Ok(h) => {
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    let _ = CloseHandle(h);
+                    false
+                } else {
+                    true
+                }
+            }
+            // мьютекс создан процессом с правами — нам его не открыть: экземпляр уже есть
+            Err(_) => false,
+        }
+    }
+}
+
+/// Попросить работающий экземпляр показать окно настроек. Его окно трея ждём до `wait`: экземпляр,
+/// запущенный через задачу планировщика, ещё стартует. Окну разрешаем встать вперёд: этот процесс
+/// запущен человеком и сейчас впереди, тот — в фоне (foreground lock).
+fn ask_to_show(wait: Duration) -> bool {
+    let until = Instant::now() + wait;
+    loop {
+        if let Ok(hwnd) = unsafe { FindWindowW(tray::WINDOW_CLASS, PCWSTR::null()) } {
+            unsafe {
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
+                let _ = PostMessageW(Some(hwnd), tray::WM_SECOND_INSTANCE, WPARAM(0), LPARAM(0));
+            }
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Задача автозапуска с правами есть, включена и запускает этот exe.
+fn task_runs_this_exe() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    match autostart::task_state() {
+        Ok(autostart::TaskState::Present { exe: task_exe, enabled: true }) => same_path(&task_exe, &exe),
+        _ => false,
+    }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().trim_matches('"').replace('/', "\\").to_lowercase();
+    norm(a) == norm(b)
+}
+
+/// Метка «показать окно после перезапуска» (кнопка «Перезапустить» в окне): свежая — показать.
+fn take_show_flag(paths: &Paths) -> bool {
+    let flag = crate::controller::show_flag(paths);
+    let fresh = std::fs::metadata(&flag)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_secs(120));
+    let _ = std::fs::remove_file(&flag);
+    fresh
+}
+
+/// `tray_only` — запуск из автозапуска: без окна настроек.
+pub fn run(tray_only: bool) -> i32 {
+    let name = wide(MUTEX);
+    if !tray_only {
+        if other_running(&name) {
+            ask_to_show(Duration::from_secs(3));
+            return 0;
+        }
+        // без прав, а автозапуск с правами включён — тот же exe с правами через задачу, без окна UAC
+        if !autostart::is_elevated() && task_runs_this_exe() && autostart::run_task().is_ok() && ask_to_show(Duration::from_secs(10)) {
+            return 0;
+        }
+    }
+    // из задачи после «Перезапустить»: прежний экземпляр ещё закрывается — подождать его
+    let wait = if tray_only { Duration::from_secs(8) } else { Duration::ZERO };
+    let started = Instant::now();
+    while !take_mutex(&name) {
+        if started.elapsed() >= wait {
+            if !tray_only {
+                ask_to_show(Duration::from_secs(3));
+            }
+            return 0;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     let epoch = Instant::now();
     unsafe {
-        // значок трея рисуется под реальный DPI, без размытия масштабированием
+        // значок трея и оверлей рисуются под реальный DPI, без размытия масштабированием
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     let paths = Paths::from_env();
@@ -53,7 +152,14 @@ pub fn run() -> i32 {
         error!("сбой в потоке {thread}: {p}");
         logger::flush();
     }));
-    info!("Verba {} запущена", env!("CARGO_PKG_VERSION"));
+    let elevated = autostart::is_elevated();
+    info!(
+        "Verba {} запущена{}{}",
+        env!("CARGO_PKG_VERSION"),
+        if elevated { " с правами администратора" } else { "" },
+        if tray_only { " (автозапуск)" } else { "" }
+    );
+    let show_window = !tray_only || take_show_flag(&paths);
 
     let mut startup_error = None;
     let (cfg, bindings, cfg_modified) = match config::load(&paths.config_file()) {
@@ -69,7 +175,8 @@ pub fn run() -> i32 {
     MATCHER.set_bindings(&bindings);
 
     let (ui_tx, ui_rx) = crossbeam_channel::unbounded();
-    let ui = match tray::create(UiState::default(), ui_tx) {
+    settings::init(ui_tx.clone());
+    let ui = match tray::create(UiState::default(), ui_tx.clone()) {
         Ok(u) => u,
         Err(e) => {
             error!("{e}");
@@ -82,12 +189,14 @@ pub fn run() -> i32 {
     }
 
     let (hook_tx, hook_rx) = crossbeam_channel::unbounded();
+    let (capture_tx, capture_rx) = crossbeam_channel::unbounded();
+    hook::set_capture_sender(capture_tx);
     let hook = match HookThread::spawn(hook_tx) {
         Ok(h) => h,
         Err(e) => {
             error!("{e}");
             ui.notify(format!("{e} → перезапусти Verba"));
-            tray::run_loop();
+            let _ = slint::run_event_loop_until_quit();
             return 1;
         }
     };
@@ -118,6 +227,14 @@ pub fn run() -> i32 {
             return 1;
         }
     };
+    let overlay = match Overlay::spawn() {
+        Ok(o) => Some(o),
+        Err(e) => {
+            // без плашки диктовка работает: ошибки уйдут уведомлениями трея
+            warn!("оверлей записи не запустился: {e}");
+            None
+        }
+    };
     info!(
         "хоткеи: диктовка {} ({:?}), пауза {}, вставить последнее {}, отмена {}",
         bindings.dictate.label(),
@@ -127,8 +244,9 @@ pub fn run() -> i32 {
         bindings.cancel.label()
     );
 
-    let parts = Parts { paths, cfg, bindings, cfg_modified, ui, net, audio, hook, paste_tx, targets, epoch };
-    let channels = Channels { hook: hook_rx, audio: audio_rx, net: net_rx, ui: ui_rx, paste: paste_rx, target: target_rx };
+    let parts = Parts { paths, cfg, bindings, cfg_modified, ui, net, audio, hook, paste_tx, targets, overlay, ui_tx, epoch };
+    let channels =
+        Channels { hook: hook_rx, audio: audio_rx, net: net_rx, ui: ui_rx, paste: paste_rx, target: target_rx, capture: capture_rx };
     let spawned = std::thread::Builder::new().name("verba-control".into()).spawn(move || {
         Controller::new(parts).run(channels);
     });
@@ -136,7 +254,14 @@ pub fn run() -> i32 {
         error!("поток контроллера: {e}");
         return 1;
     }
-    tray::run_loop();
+    // цикл Slint (winit) при старте забирает Raw Input клавиатуры себе — вернуть его сторожу хука
+    slint::Timer::single_shot(Duration::ZERO, move || hook.raw_input(true));
+    if show_window {
+        settings::open_at_start();
+    }
+    if let Err(e) = slint::run_event_loop_until_quit() {
+        error!("цикл окна: {e}");
+    }
     info!("Verba завершена");
     logger::flush();
     0

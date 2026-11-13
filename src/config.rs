@@ -10,10 +10,11 @@ use std::time::SystemTime;
 
 use crate::hotkey::binding::Binding;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HotkeyMode {
     /// держать: запись идёт, пока сочетание нажато
+    #[default]
     Hold,
     /// нажал-включил: первое нажатие начинает, второе заканчивает
     Toggle,
@@ -240,6 +241,8 @@ pub struct Config {
     pub recording: Recording,
     pub paste: Paste,
     pub sounds: Sounds,
+    /// где плашка записи: внизу по центру, вверху, нигде
+    pub overlay: crate::overlay::Position,
     /// сколько последних диктовок держать в меню трея (только в памяти)
     pub history_size: usize,
 }
@@ -256,6 +259,7 @@ impl Default for Config {
             recording: Recording::default(),
             paste: Paste::default(),
             sounds: Sounds::default(),
+            overlay: crate::overlay::Position::Bottom,
             history_size: 10,
         }
     }

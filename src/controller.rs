@@ -12,7 +12,16 @@
 //! Вставка в запомненное поле (`paste.remember_field`): при нажатии — снимок поля (`target`),
 //! после распознавания текст уходит в это поле, даже если человек ушёл в другое окно. Пока идёт
 //! новая запись, такая вставка ждёт её конца: фокус во время диктовки не трогаем.
+//!
+//! Окно настроек (`prefs.rs`): его действия приходят сюда же, контроллер меняет настройки, пишет
+//! config.json и шлёт окну новое состояние — изменения действуют сразу, без перезапуска.
+//! Оверлей записи — плашка внизу экрана: запись → распознаю → скрыта или ошибка словами.
 
+mod prefs;
+
+pub use prefs::{show_flag, Worker};
+
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::{select, Receiver, Sender};
 
 use crate::audio::recorder::{AudioCmd, AudioEvent};
-use crate::config::{self, Bindings, Config, Engine, Paths, ProxyConfig, ProxyKind};
+use crate::config::{self, Bindings, Config, Engine, Paths, ProxyKind};
 use crate::hotkey::binding::{Binding, MOD_ALT, MOD_WIN};
 use crate::hotkey::hook::{self, HookEvent, HookThread, HotkeyId, MATCHER};
 use crate::hotkey::mode::{Action, ModeMachine};
@@ -29,8 +38,10 @@ use crate::net::codex::{self, CodexSetup};
 use crate::net::service::{Job, NetCmd, NetEvent, NetService};
 use crate::net::words::Service;
 use crate::net::{proxy, timing_words, words, Route, Warm};
+use crate::overlay::{Overlay, Position};
 use crate::paste::{self, PasteReport};
 use crate::secrets;
+use crate::settings::{self, ViewData};
 use crate::sound::{self, Cue};
 use crate::target::{self, Delivered, How, Snapshot, TargetService, Why};
 use crate::tray::{MenuCmd, Status, UiEvent, UiHandle};
@@ -49,6 +60,8 @@ pub struct Channels {
     pub ui: Receiver<UiEvent>,
     pub paste: Receiver<(u64, PasteReport)>,
     pub target: Receiver<Delivered>,
+    /// сочетание, пойманное хуком при захвате в окне настроек
+    pub capture: Receiver<Binding>,
 }
 
 #[derive(Default)]
@@ -119,6 +132,52 @@ pub struct Controller {
     hook: HookThread,
     paste_tx: Sender<(u64, PasteReport)>,
     targets: TargetService,
+    overlay: Plate,
+    /// канал событий UI: им же возвращаются итоги фоновой работы (`Worker`)
+    ui_tx: Sender<UiEvent>,
+    /// состояние окна настроек
+    prefs: prefs::Prefs,
+    /// последнее, что ушло окну настроек: одинаковое не шлём
+    shown_view: RefCell<Option<ViewData>>,
+}
+
+/// Плашка записи; оверлей не запустился — все вызовы ничего не делают.
+struct Plate(Option<Overlay>);
+
+impl Plate {
+    fn set_position(&self, p: Position) {
+        if let Some(o) = &self.0 {
+            o.set_position(p);
+        }
+    }
+    fn recording(&self) {
+        if let Some(o) = &self.0 {
+            o.recording();
+        }
+    }
+    fn transcribing(&self) {
+        if let Some(o) = &self.0 {
+            o.transcribing();
+        }
+    }
+    fn error(&self, text: &str) {
+        if let Some(o) = &self.0 {
+            o.error(text);
+        }
+    }
+    fn flash(&self, text: &str) {
+        if let Some(o) = &self.0 {
+            o.flash(text);
+        }
+    }
+    fn hide(&self) {
+        if let Some(o) = &self.0 {
+            o.hide();
+        }
+    }
+    fn works(&self) -> bool {
+        self.0.is_some()
+    }
 }
 
 fn sec(ms: u64) -> String {
@@ -140,6 +199,9 @@ pub struct Parts {
     pub hook: HookThread,
     pub paste_tx: Sender<(u64, PasteReport)>,
     pub targets: TargetService,
+    /// None — оверлей не запустился: ошибки уходят уведомлениями трея
+    pub overlay: Option<Overlay>,
+    pub ui_tx: Sender<UiEvent>,
     pub epoch: Instant,
 }
 
@@ -175,7 +237,13 @@ impl Controller {
             hook: p.hook,
             paste_tx: p.paste_tx,
             targets: p.targets,
+            overlay: Plate(p.overlay),
+            ui_tx: p.ui_tx,
+            prefs: prefs::Prefs::default(),
+            shown_view: RefCell::new(None),
         };
+        c.overlay.set_position(c.cfg.overlay);
+        c.prefs.key_mask = secrets::read(secrets::OPENROUTER_KEY).map(|k| settings::mask_key(&k));
         if c.pending.is_some() {
             info!("есть нераспознанная запись с прошлого раза — «вставить последнее» отправит её");
         }
@@ -198,7 +266,7 @@ impl Controller {
                 recv(ch.audio) -> m => if let Ok(e) = m { self.on_audio(e) },
                 recv(ch.net) -> m => if let Ok(e) = m { self.on_net(e) },
                 recv(ch.ui) -> m => match m {
-                    Ok(UiEvent::Menu(MenuCmd::Exit)) | Err(_) => {
+                    Ok(UiEvent::Menu(MenuCmd::Exit)) | Ok(UiEvent::Settings(settings::Cmd::Exit)) | Err(_) => {
                         self.shutdown();
                         return;
                     }
@@ -206,6 +274,7 @@ impl Controller {
                 },
                 recv(ch.paste) -> m => if let Ok((id, r)) = m { self.on_paste(id, r) },
                 recv(ch.target) -> m => if let Ok(d) = m { self.on_target(d) },
+                recv(ch.capture) -> m => if let Ok(b) = m { self.on_captured(b) },
                 default(wait) => {}
             }
             self.tick();
@@ -216,7 +285,9 @@ impl Controller {
         if let Some((id, _)) = self.recording.take() {
             let _ = self.audio.send(AudioCmd::Cancel { id });
         }
-        info!("Verba закрыта из трея");
+        hook::set_capturing(false);
+        self.overlay.hide();
+        info!("Verba закрыта");
         self.ui.quit();
     }
 
@@ -302,6 +373,7 @@ impl Controller {
         if self.cfg.sounds.recording {
             sound::play(Cue::Start);
         }
+        self.overlay.recording();
         self.publish();
     }
 
@@ -319,6 +391,7 @@ impl Controller {
         if self.cfg.sounds.recording {
             sound::play(Cue::Stop);
         }
+        self.overlay.transcribing();
         self.publish();
         self.flush_deferred();
     }
@@ -330,8 +403,21 @@ impl Controller {
         self.dictations.remove(&id);
         self.machine.reset();
         info!("диктовка #{id}: отменена");
+        self.overlay_idle();
         self.publish();
         self.flush_deferred();
+    }
+
+    /// Плашка после записи: идёт распознавание — «распознаю», иначе скрыть.
+    fn overlay_idle(&self) {
+        if self.recording.is_some() {
+            return;
+        }
+        if self.dictations.values().any(|d| d.sent_at.is_some() || d.released_at.is_some()) {
+            self.overlay.transcribing();
+        } else {
+            self.overlay.hide();
+        }
     }
 
     fn toggle_pause(&mut self) {
@@ -340,6 +426,7 @@ impl Controller {
         if self.paused {
             self.cancel();
         }
+        self.overlay.flash(if self.paused { "Пауза" } else { "Слушаю" });
         if self.cfg.sounds.pause {
             sound::play(if self.paused { Cue::PauseOn } else { Cue::PauseOff });
         }
@@ -418,7 +505,9 @@ impl Controller {
                     self.dictations.remove(&id);
                     info!("диктовка #{id}: речи нет (запись {}{mic}) — не отправлял", sec(processed.total_ms));
                     if processed.total_ms >= 1500 {
-                        self.ui.notify("Речи не слышно → проверь микрофон: выбран тот и не выключен ли звук");
+                        self.show_error("Речи не слышно → проверь микрофон: выбран тот и не выключен ли звук");
+                    } else {
+                        self.overlay_idle();
                     }
                     self.publish();
                     return;
@@ -532,28 +621,10 @@ impl Controller {
                 }
                 self.publish();
             }
-            NetEvent::KeyChecked(r) => {
-                let text = match r {
-                    Ok((200, ms)) => format!("Ключ OpenRouter принят, ответ за {}", sec(ms)),
-                    Ok((401 | 403, _)) => "OpenRouter не принял ключ → скопируй его заново целиком".to_string(),
-                    Ok((s, _)) => format!("Ключ сохранён; OpenRouter ответил {s} — проверь диктовкой"),
-                    Err(e) => format!("Ключ сохранён, но проверить не удалось: {e}"),
-                };
-                info!("проверка ключа: {text}");
-                self.ui.notify(text);
-            }
-            NetEvent::CodexChecked(r) => {
-                let text = match r {
-                    Ok(c) => format!(
-                        "ChatGPT по входу Codex работает: ответ за {}{}",
-                        sec(c.ms),
-                        if c.renewed { "; вход Codex обновлён" } else { "" }
-                    ),
-                    Err(e) => e,
-                };
-                info!("проверка движка ChatGPT: {text}");
-                self.ui.notify(text);
-            }
+            NetEvent::KeyChecked(r) => self.on_key_checked(r),
+            NetEvent::CodexChecked(r) => self.on_codex_checked(r),
+            NetEvent::Models(r) => self.on_models(r),
+            NetEvent::ProxyChecked { host, port, result } => self.on_proxy_checked(host, port, result),
             NetEvent::ProxyDetected { host, port, kind } => {
                 let same = self.cfg.proxy.as_ref().is_some_and(|p| p.host == host && p.port == port);
                 match kind {
@@ -608,6 +679,7 @@ impl Controller {
             info!("диктовка #{}: распознана, не вставлена (отмена или экран заблокирован)", d.id);
             self.log_timing(&d, None);
         }
+        self.overlay_idle();
         self.publish();
     }
 
@@ -710,11 +782,21 @@ impl Controller {
     fn fail(&mut self, id: u64, words: String) {
         error!("диктовка #{id}: {words}");
         self.error = Some(words.clone());
-        self.ui.notify(words);
+        self.show_error(&words);
         if self.cfg.sounds.errors {
             sound::play(Cue::Error);
         }
         self.publish();
+    }
+
+    /// Ошибка словами: на плашке записи, если она включена (и не мешает идущей записи), иначе —
+    /// уведомлением трея. Значок трея держит ошибку до удачной диктовки в любом случае.
+    fn show_error(&self, words: &str) {
+        if self.overlay.works() && self.cfg.overlay != Position::Off && self.recording.is_none() {
+            self.overlay.error(words);
+        } else {
+            self.ui.notify(words.to_string());
+        }
     }
 
     /// Строка лога с фазами (CLAUDE.md §6): без текста диктовки и ключей.
@@ -807,24 +889,13 @@ impl Controller {
                     if let Some(m) = self.cfg.openrouter.models.get(i).cloned() {
                         // модель OpenRouter выбирает и сам движок
                         info!("движок OpenRouter, модель: {m}");
-                        self.cfg.openrouter.model = m;
-                        self.cfg.engine = Engine::OpenRouter;
-                        self.save_config();
-                        self.publish();
+                        self.set(|c| {
+                            c.openrouter.model = m;
+                            c.engine = Engine::OpenRouter;
+                        });
                     }
                 }
-                MenuCmd::SelectEngine(engine) => {
-                    if engine != self.cfg.engine {
-                        info!("движок: {} — со следующей диктовки", engine.label());
-                        self.cfg.engine = engine;
-                        self.save_config();
-                        if engine == Engine::OpenRouter && !self.has_key {
-                            self.ui.notify(words::no_key());
-                        }
-                        self.publish();
-                    }
-                }
-                MenuCmd::CheckEngine => self.check_engine(),
+                MenuCmd::SelectEngine(engine) => self.select_engine(engine),
                 MenuCmd::CopyHistory(i) => {
                     if let Some(t) = self.history.get(i) {
                         if !paste::copy_text(t) {
@@ -832,12 +903,10 @@ impl Controller {
                         }
                     }
                 }
-                MenuCmd::OpenConfig => open_file(&self.paths.config_file()),
-                MenuCmd::OpenLog => open_file(&self.paths.log_file()),
-                MenuCmd::KeyFromClipboard => self.key_from_clipboard(),
-                MenuCmd::ProxyFromClipboard => self.proxy_from_clipboard(),
                 MenuCmd::Exit => {}
             },
+            UiEvent::Settings(cmd) => self.on_settings(cmd),
+            UiEvent::Worker(w) => self.on_worker(w),
             UiEvent::Lock => {
                 self.locked = true;
                 // отпускание сочетания на экране блокировки хук не увидит — запись не должна висеть
@@ -870,78 +939,15 @@ impl Controller {
         }
     }
 
-    /// «Проверить» в трее: путь до движка целиком; итог и задержка — уведомлением.
-    fn check_engine(&mut self) {
-        match self.cfg.engine {
-            Engine::OpenRouter => match secrets::read(secrets::OPENROUTER_KEY) {
-                Some(key) => self.net.send(NetCmd::CheckKey { key }),
-                None => {
-                    self.has_key = false;
-                    self.ui.notify(words::no_key());
-                    self.publish();
-                }
-            },
-            Engine::Codex => {
-                info!("проверка движка ChatGPT: 0,3 с тишины");
-                self.net.send(NetCmd::CheckCodex);
-            }
-        }
-    }
-
-    fn key_from_clipboard(&mut self) {
-        let Some(text) = paste::clipboard_text() else {
-            self.ui.notify("В буфере обмена нет текста → скопируй ключ OpenRouter и выбери пункт ещё раз");
-            return;
-        };
-        let key = text.trim().to_string();
-        if key.len() < 20 || key.contains(char::is_whitespace) {
-            self.ui.notify("В буфере не ключ OpenRouter → скопируй ключ вида sk-or-v1-… с openrouter.ai/settings/keys");
+    fn select_engine(&mut self, engine: Engine) {
+        if engine == self.cfg.engine {
             return;
         }
-        if let Err(e) = secrets::write(secrets::OPENROUTER_KEY, "openrouter", &key) {
-            self.fail(0, e);
-            return;
+        info!("движок: {} — со следующей диктовки", engine.label());
+        self.set(|c| c.engine = engine);
+        if engine == Engine::OpenRouter && !self.has_key && !self.prefs.open {
+            self.ui.notify(words::no_key());
         }
-        paste::clear_clipboard_if(&key);
-        info!("ключ OpenRouter сохранён в Credential Manager");
-        self.has_key = true;
-        self.error = None;
-        self.net.send(NetCmd::CheckKey { key });
-        self.publish();
-    }
-
-    fn proxy_from_clipboard(&mut self) {
-        let Some(text) = paste::clipboard_text() else {
-            self.ui.notify("В буфере обмена нет текста → скопируй строку прокси");
-            return;
-        };
-        let p = match proxy::parse(&text) {
-            Ok(p) => p,
-            Err(e) => {
-                self.ui.notify(e);
-                return;
-            }
-        };
-        match &p.pass {
-            Some(pass) => {
-                if let Err(e) = secrets::write(secrets::PROXY_PASSWORD, p.user.as_deref().unwrap_or(""), pass) {
-                    self.fail(0, e);
-                    return;
-                }
-            }
-            None => secrets::delete(secrets::PROXY_PASSWORD),
-        }
-        if p.pass.is_some() {
-            paste::clear_clipboard_if(text.trim());
-        }
-        let kind = p.kind.unwrap_or(ProxyKind::Auto);
-        info!("прокси {}:{} ({kind:?}) сохранён", p.host, p.port);
-        self.cfg.proxy = Some(ProxyConfig { kind, host: p.host.clone(), port: p.port, user: p.user });
-        self.save_config();
-        self.apply_route();
-        let tail = if kind == ProxyKind::Auto { " — определяю вид" } else { "" };
-        self.ui.notify(format!("Прокси {}:{} сохранён{tail}", p.host, p.port));
-        self.publish();
     }
 
     // ---------- настройки ----------
@@ -991,6 +997,50 @@ impl Controller {
         }
     }
 
+    /// Изменение из окна настроек или меню трея: проверить, применить сразу, записать в config.json.
+    /// Ошибка проверки (два одинаковых сочетания) — слова для человека, настройки прежние.
+    fn change(&mut self, f: impl FnOnce(&mut Config)) -> Result<(), String> {
+        let mut new = self.cfg.clone();
+        f(&mut new);
+        let bindings = new.validate()?;
+        self.adopt(new, bindings);
+        self.save_config();
+        Ok(())
+    }
+
+    /// `change` из меню трея: ошибка — уведомлением.
+    fn set(&mut self, f: impl FnOnce(&mut Config)) {
+        if let Err(e) = self.change(f) {
+            warn!("{e}");
+            self.ui.notify(e);
+        }
+    }
+
+    /// Новые настройки — в дело без перезапуска: хоткеи, режим, микрофон, маршрут, плашка.
+    fn adopt(&mut self, new: Config, bindings: Bindings) {
+        let route_changed =
+            new.proxy != self.cfg.proxy || new.openrouter.base_url != self.cfg.openrouter.base_url || new.codex != self.cfg.codex;
+        let mic_changed = new.microphone != self.cfg.microphone;
+        let keys_changed = new.hotkeys != self.cfg.hotkeys;
+        if keys_changed && self.recording.is_some() {
+            // режим и сочетания меняются только между записями — иначе отпускание потеряет смысл
+            self.cancel();
+        }
+        let overlay = new.overlay;
+        self.cfg = new;
+        self.bindings = bindings;
+        MATCHER.set_bindings(&self.bindings);
+        self.machine.configure(self.cfg.hotkeys.mode, self.cfg.hotkeys.hybrid_hold_ms);
+        if mic_changed {
+            let _ = self.audio.send(AudioCmd::Configure(self.cfg.microphone.clone()));
+        }
+        if route_changed {
+            self.apply_route();
+        }
+        self.overlay.set_position(overlay);
+        self.publish();
+    }
+
     fn reload_if_changed(&mut self) {
         let path = self.paths.config_file();
         let m = config::modified(&path);
@@ -1006,21 +1056,7 @@ impl Controller {
                     return;
                 }
                 info!("настройки перечитаны");
-                let proxy_changed = l.config.proxy != self.cfg.proxy
-                    || l.config.openrouter.base_url != self.cfg.openrouter.base_url
-                    || l.config.codex != self.cfg.codex;
-                let mic_changed = l.config.microphone != self.cfg.microphone;
-                self.cfg = l.config;
-                self.bindings = l.bindings;
-                MATCHER.set_bindings(&self.bindings);
-                self.machine.configure(self.cfg.hotkeys.mode, self.cfg.hotkeys.hybrid_hold_ms);
-                if mic_changed {
-                    let _ = self.audio.send(AudioCmd::Configure(self.cfg.microphone.clone()));
-                }
-                if proxy_changed {
-                    self.apply_route();
-                }
-                self.publish();
+                self.adopt(l.config, l.bindings);
             }
             Err(e) => {
                 warn!("{e}");
@@ -1031,6 +1067,7 @@ impl Controller {
 
     fn tick(&mut self) {
         let now = Instant::now();
+        self.capture_tick(now);
         if let Some((id, pressed_at)) = self.recording {
             let limit = Duration::from_secs(u64::from(self.cfg.recording.max_seconds));
             if now.duration_since(pressed_at) >= limit {
@@ -1096,6 +1133,20 @@ impl Controller {
             s.has_key = has_key;
             s.proxy = proxy;
         });
+        self.push_view();
+    }
+
+    /// Окно настроек открыто — шлём ему состояние, если оно изменилось.
+    fn push_view(&self) {
+        if !self.prefs.open {
+            return;
+        }
+        let v = self.settings_view();
+        let mut shown = self.shown_view.borrow_mut();
+        if shown.as_ref() != Some(&v) {
+            *shown = Some(v.clone());
+            settings::push(settings::Msg::View(Box::new(v)));
+        }
     }
 }
 

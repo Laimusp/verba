@@ -149,6 +149,40 @@ pub fn read_login(path: &Path) -> Login {
     Login::Ready(auth)
 }
 
+/// Кто вошёл в Codex — для окна настроек: «ChatGPT Plus · почта». Почта в лог не пишется.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Profile {
+    /// `chatgpt_plan_type`: plus, pro, team…
+    pub plan: Option<String>,
+    pub email: Option<String>,
+}
+
+/// Тариф и почта из claims токена доступа (`https://api.openai.com/auth`, `…/profile`).
+pub fn profile_of_token(token: &str) -> Profile {
+    let Some(c) = jwt_claims(token) else { return Profile::default() };
+    let plan = text(c.get("https://api.openai.com/auth").and_then(|a| a.get("chatgpt_plan_type")));
+    let email = text(c.get("https://api.openai.com/profile").and_then(|p| p.get("email"))).or_else(|| text(c.get("email")));
+    Profile { plan, email }
+}
+
+impl Profile {
+    /// «ChatGPT Plus · me@example.com»; ничего не известно — «ChatGPT».
+    pub fn words(&self) -> String {
+        let plan = match self.plan.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") => "ChatGPT".to_string(),
+            Some(p) => {
+                let mut c = p.chars();
+                let cap: String = c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default();
+                format!("ChatGPT {cap}")
+            }
+        };
+        match &self.email {
+            Some(e) => format!("{plan} · {e}"),
+            None => plan,
+        }
+    }
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -478,7 +512,7 @@ impl Codex {
 const NOT_FOUND: &str = "Codex не найден на этом ПК";
 
 pub fn no_login() -> String {
-    "Codex не вошёл в ChatGPT → в терминале «codex login» (вход через ChatGPT) или выбери в трее движок OpenRouter".into()
+    "Codex не вошёл в ChatGPT → в терминале «codex login» (вход через ChatGPT) или выбери в настройках Verba движок OpenRouter".into()
 }
 
 pub fn api_key() -> String {
@@ -486,7 +520,7 @@ pub fn api_key() -> String {
 }
 
 pub fn not_installed() -> String {
-    "Codex не установлен → поставь Codex CLI («npm i -g @openai/codex») и войди через ChatGPT («codex login») или выбери в трее движок OpenRouter".into()
+    "Codex не установлен → поставь Codex CLI («npm i -g @openai/codex») и войди через ChatGPT («codex login») или выбери в настройках Verba движок OpenRouter".into()
 }
 
 pub fn broken(why: &str) -> String {
@@ -551,6 +585,18 @@ pub fn trace_words(t: &Trace) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_reads_plan_and_email_from_token() {
+        let t = jwt(serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+            "https://api.openai.com/profile": {"email": "me@example.com"}
+        }));
+        assert_eq!(profile_of_token(&t).words(), "ChatGPT Plus · me@example.com");
+        assert_eq!(profile_of_token("не jwt").words(), "ChatGPT");
+        let only_email = jwt(serde_json::json!({"email": "a@b.c"}));
+        assert_eq!(profile_of_token(&only_email).words(), "ChatGPT · a@b.c");
+    }
     use serde_json::json;
 
     fn jwt(claims: Value) -> String {

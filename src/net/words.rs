@@ -13,15 +13,15 @@ pub fn or_message(json: Option<&serde_json::Value>) -> String {
 }
 
 pub fn no_key() -> String {
-    "нет ключа OpenRouter → скопируй ключ с openrouter.ai/settings/keys и выбери в трее «Ключ OpenRouter из буфера»".into()
+    "нет ключа OpenRouter → вставь его в настройках Verba (значок в трее); ключ — на openrouter.ai/settings/keys".into()
 }
 
 pub fn refusal(status: u16, said: &str, model: &str) -> String {
     let tail = if said.is_empty() { String::new() } else { format!(": {said}") };
     match status {
-        401 | 403 => "OpenRouter не принял ключ → скопируй ключ заново и выбери в трее «Ключ OpenRouter из буфера»".into(),
+        401 | 403 => "OpenRouter не принял ключ → замени его в настройках Verba (значок в трее)".into(),
         402 => "на счету OpenRouter не хватает денег → пополни баланс на openrouter.ai/settings/credits".into(),
-        404 => format!("у OpenRouter нет модели {model} → выбери другую в трее: «Движок и модель»{tail}"),
+        404 => format!("у OpenRouter нет модели {model} → выбери другую в настройках Verba{tail}"),
         408 | 504 => "модель не успела распознать запись → «вставить последнее» отправит её снова".into(),
         413 => "запись слишком большая для OpenRouter → запиши короче".into(),
         429 => "OpenRouter просит подождать → «вставить последнее» через минуту".into(),

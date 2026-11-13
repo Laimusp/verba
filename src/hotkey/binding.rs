@@ -57,6 +57,25 @@ impl Binding {
         Ok(Binding { vk, mods })
     }
 
+    /// Строка для config.json («ctrl+alt+p»): `parse` читает её обратно в то же сочетание.
+    pub fn to_config(self) -> String {
+        let mut out = String::new();
+        for (bit, name) in [(MOD_CTRL, "ctrl"), (MOD_ALT, "alt"), (MOD_SHIFT, "shift"), (MOD_WIN, "win")] {
+            if self.mods & bit != 0 {
+                out.push_str(name);
+                out.push('+');
+            }
+        }
+        let key = match self.vk {
+            0x41..=0x5A | 0x30..=0x39 => char::from(self.vk as u8).to_ascii_lowercase().to_string(),
+            0x70..=0x87 => format!("f{}", self.vk - 0x70 + 1),
+            0x60..=0x69 => format!("numpad{}", self.vk - 0x60),
+            vk => NAMED.iter().find(|(_, v)| *v == vk).map(|(n, _)| n.to_string()).unwrap_or_else(|| format!("vk{vk:02x}")),
+        };
+        out.push_str(&key);
+        out
+    }
+
     /// «Ctrl+Alt+P» — для меню и сообщений.
     pub fn label(self) -> String {
         let mut out = String::new();
@@ -223,6 +242,16 @@ mod tests {
         let b = Binding::parse("ctrl+alt+shift+win+f12").unwrap();
         assert_eq!(Binding::unpack(b.pack()), Some(b));
         assert_eq!(Binding::unpack(0), None);
+    }
+
+    #[test]
+    fn config_string_roundtrip() {
+        for s in ["ctrl+space", "ctrl+alt+p", "win+shift+f13", "esc", "rctrl", "alt+numpad5", "ctrl+vk7f", "shift+`", "ctrl+9"] {
+            let b = Binding::parse(s).unwrap();
+            assert_eq!(Binding::parse(&b.to_config()).unwrap(), b, "{s} → {}", b.to_config());
+        }
+        assert_eq!(Binding { vk: 0x20, mods: MOD_CTRL | MOD_ALT }.to_config(), "ctrl+alt+space");
+        assert_eq!(Binding { vk: 0x2D, mods: 0 }.to_config(), "insert");
     }
 
     #[test]

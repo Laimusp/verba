@@ -7,6 +7,9 @@
 //!
 //! Поток трея ничего не ждёт (CLAUDE.md §2): состояние берёт под коротким локом, команды меню
 //! отправляет каналом, файлы открывает из отдельного потока.
+//!
+//! Окно трея живёт в главном потоке рядом с окном настроек: сообщения ему раздаёт цикл Slint
+//! (`slint::run_event_loop_until_quit`). Щелчок по значку — окно настроек, правая кнопка — меню.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -27,13 +30,12 @@ use windows::Win32::UI::Shell::{
     NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenuEx, TranslateMessage, HICON, HMENU, ICONINFO, MF_CHECKED,
-    MF_GRAYED, MF_POPUP, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, SM_CXSMICON, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
-    WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK,
-    WTS_SESSION_UNLOCK,
+    AppendMenuW, ChangeWindowMessageFilterEx, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyIcon, DestroyMenu, DestroyWindow, GetCursorPos, PostMessageW, RegisterClassW, RegisterWindowMessageW,
+    SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenuEx, HICON, HMENU, ICONINFO, MF_CHECKED, MF_GRAYED, MF_POPUP,
+    MF_STRING, MSGFLT_ALLOW, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, SM_CXSMICON, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_POWERBROADCAST, WM_SETTINGCHANGE,
+    WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use crate::config::Engine;
@@ -42,7 +44,7 @@ use crate::icons::{self, IconState};
 pub const WINDOW_CLASS: PCWSTR = w!("VerbaTray");
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_REFRESH: u32 = WM_APP + 2;
-/// второй экземпляр Verba просит показать, что первый уже работает
+/// второй запуск Verba просит первый показать окно настроек
 pub const WM_SECOND_INSTANCE: u32 = WM_APP + 3;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const TRAY_ID: u32 = 1;
@@ -82,14 +84,8 @@ pub struct UiState {
 pub enum MenuCmd {
     TogglePause,
     SelectEngine(Engine),
-    /// «Проверить движок»: путь до сервиса целиком, итог — уведомлением
-    CheckEngine,
     SelectModel(usize),
     CopyHistory(usize),
-    OpenConfig,
-    OpenLog,
-    KeyFromClipboard,
-    ProxyFromClipboard,
     Exit,
 }
 
@@ -99,6 +95,10 @@ pub enum UiEvent {
     Lock,
     Unlock,
     Resume,
+    /// действие в окне настроек
+    Settings(crate::settings::Cmd),
+    /// итог фоновой работы контроллера (список микрофонов, автозапуск)
+    Worker(crate::controller::Worker),
 }
 
 #[derive(Clone)]
@@ -365,9 +365,8 @@ impl Ctx {
             };
             let head: String = head.chars().take(90).collect();
             add(menu, MF_STRING | MF_GRAYED, 1, &esc(&head));
-            if !s.has_key {
-                add(menu, MF_STRING, 30, "Ключ OpenRouter из буфера обмена");
-            }
+            add(menu, MF_STRING, 20, "Настройки");
+            let _ = SetMenuDefaultItem(menu, 20, 0);
             add(menu, MF_STRING | if s.paused { MF_CHECKED } else { MF_STRING }, 2, &format!("Пауза\t{}", s.pause_label));
 
             if let Ok(models) = CreatePopupMenu() {
@@ -377,15 +376,8 @@ impl Ctx {
                     add(models, check(!s.codex && *m == s.model), 100 + i, &esc(&format!("      {m}")));
                 }
                 add(models, check(s.codex), 11, "ChatGPT по входу Codex");
-                add(models, MF_STRING, 30, "Ключ OpenRouter из буфера обмена");
-                let proxy = match &s.proxy {
-                    Some(p) => format!("Прокси из буфера обмена (сейчас {p})"),
-                    None => "Прокси из буфера обмена".into(),
-                };
-                add(models, MF_STRING, 31, &esc(&proxy));
                 add(menu, MF_POPUP, models.0 as usize, "Движок и модель");
             }
-            add(menu, MF_STRING, 32, "Проверить движок");
             if let Ok(hist) = CreatePopupMenu() {
                 if s.history.is_empty() {
                     add(hist, MF_STRING | MF_GRAYED, 8, "Диктовок пока нет");
@@ -399,8 +391,6 @@ impl Ctx {
                 }
                 add(menu, MF_POPUP, hist.0 as usize, &format!("Последние диктовки\t{}", s.paste_last_label));
             }
-            add(menu, MF_STRING, 20, "Открыть настройки");
-            add(menu, MF_STRING, 21, "Открыть лог");
             add(menu, MF_STRING, 99, "Выход");
 
             let mut pt = POINT::default();
@@ -411,15 +401,14 @@ impl Ctx {
                 as usize;
             let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
             let _ = DestroyMenu(menu);
+            if cmd == 20 {
+                crate::settings::request_open();
+                return;
+            }
             let cmd = match cmd {
                 2 => Some(MenuCmd::TogglePause),
                 10 => Some(MenuCmd::SelectEngine(Engine::OpenRouter)),
                 11 => Some(MenuCmd::SelectEngine(Engine::Codex)),
-                32 => Some(MenuCmd::CheckEngine),
-                20 => Some(MenuCmd::OpenConfig),
-                21 => Some(MenuCmd::OpenLog),
-                30 => Some(MenuCmd::KeyFromClipboard),
-                31 => Some(MenuCmd::ProxyFromClipboard),
                 99 => Some(MenuCmd::Exit),
                 100..=149 => Some(MenuCmd::SelectModel(cmd - 100)),
                 200..=249 => Some(MenuCmd::CopyHistory(cmd - 200)),
@@ -446,12 +435,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     match msg {
         WM_TRAY => {
             let event = (lparam.0 as u32) & 0xFFFF;
-            if event == WM_CONTEXTMENU || event == NIN_SELECT || event == NIN_KEYSELECT || event == WM_LBUTTONUP {
+            if event == WM_CONTEXTMENU {
                 // пока меню открыто, обновления не применяются (контекст занят) — применить после
                 with_ctx(|c| {
                     c.show_menu();
                     c.refresh();
                 });
+            } else if event == NIN_SELECT || event == NIN_KEYSELECT {
+                crate::settings::request_open();
             }
             LRESULT(0)
         }
@@ -460,12 +451,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_SECOND_INSTANCE => {
-            with_ctx(|c| {
-                if let Ok(mut s) = c.state.lock() {
-                    s.balloons.push("Verba уже работает — значок в трее".into());
-                }
-                c.refresh();
-            });
+            crate::settings::request_open();
             LRESULT(0)
         }
         WM_SETTINGCHANGE => {
@@ -509,7 +495,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     let _ = DestroyIcon(h);
                 }
             });
-            PostQuitMessage(0);
+            crate::settings::close_if_open();
+            let _ = slint::quit_event_loop();
             LRESULT(0)
         }
         _ => {
@@ -541,6 +528,12 @@ pub fn create(state: UiState, tx: Sender<UiEvent>) -> Result<UiHandle, String> {
         let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, WINDOW_CLASS, w!("Verba"), WS_POPUP, 0, 0, 0, 0, None, None, Some(hinst), None)
             .map_err(|e| format!("окно трея: {e}"))?;
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        // Verba с правами (автозапуск из планировщика): UIPI не пускает сообщения от процессов без
+        // прав — второй запуск с рабочего стола и закрытие при обновлении (WM_CLOSE) пропускаем явно
+        // TaskbarCreated — тоже: без него значок не вернётся после перезапуска Проводника
+        for m in [WM_SECOND_INSTANCE, WM_CLOSE, RegisterWindowMessageW(w!("TaskbarCreated"))] {
+            let _ = ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, None);
+        }
         let state = Arc::new(Mutex::new(state));
         let ctx = Ctx {
             hwnd,
@@ -554,16 +547,5 @@ pub fn create(state: UiState, tx: Sender<UiEvent>) -> Result<UiHandle, String> {
         CTX.with(|c| *c.borrow_mut() = Some(ctx));
         with_ctx(|c| c.add());
         Ok(UiHandle { hwnd: hwnd.0 as isize, state })
-    }
-}
-
-/// Цикл сообщений главного потока; возвращается после закрытия окна трея.
-pub fn run_loop() {
-    unsafe {
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
     }
 }

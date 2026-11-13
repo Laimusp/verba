@@ -9,7 +9,7 @@
 //!   слова, сказанные одновременно с нажатием, не теряются.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,23 @@ mod tests {
     }
 }
 
+/// Громкость записи для оверлея: RMS самого громкого блока колбэка с прошлого взятия, биты `f32`.
+/// Колбэк кладёт без локов и аллокаций через `fetch_max` — у неотрицательных `f32` порядок битов как у чисел;
+/// оверлей раз в 70 мс забирает `swap(0)` (`src/overlay.rs`).
+pub static LEVEL: AtomicU32 = AtomicU32::new(0);
+
+/// RMS блока → `LEVEL`, если громче того, что уже лежит.
+fn put_level(mono: &[f32]) {
+    if mono.is_empty() {
+        return;
+    }
+    let sum: f32 = mono.iter().map(|s| s * s).sum();
+    let rms = (sum / mono.len() as f32).sqrt();
+    if rms.is_finite() && rms > 0.0 {
+        LEVEL.fetch_max(rms.to_bits(), Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 struct Capture {
     samples: Mutex<Vec<f32>>,
@@ -57,6 +74,7 @@ struct Capture {
 impl Capture {
     fn push(&self, mono: &[f32]) {
         if self.recording.load(Ordering::Relaxed) {
+            put_level(mono);
             if let Ok(mut s) = self.samples.lock() {
                 s.extend_from_slice(mono);
             }

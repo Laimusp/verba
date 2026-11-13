@@ -4,6 +4,12 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let code = if args.is_empty() { verba::app::run() } else { verba::cli::run(&args) };
+    let code = match args.as_slice() {
+        // руками: окно настроек и трей
+        [] => verba::app::run(false),
+        // из автозапуска (задача планировщика): только трей
+        [a] if a == verba::autostart::TRAY_ARG => verba::app::run(true),
+        _ => verba::cli::run(&args),
+    };
     std::process::exit(code);
 }
